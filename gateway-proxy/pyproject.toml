@@ -1,0 +1,10 @@
+[project]
+name = "gateway-proxy"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.141.1",
+    "httpx[http2]>=0.28.1",
+    "uvicorn[standard]>=0.52.4",
+]
