@@ -1,22 +1,50 @@
 """Unit tests for the OpenAI <-> AI SDK v3 converter.
 
 Wire-format assertions ensure converter.py and server.py always agree on
-the exact shape sent to / received from the Vercel AI Gateway.
+the exact shape sent to / received from the Vercel AI Gateway (fx wire
+format: tool calls as content parts with raw-JSON `input`).
 """
 
+import asyncio
 import json
 
 from converter import (
     _openai_content_to_v3_parts,
     _openai_tool_call_to_v3,
+    _openai_tool_msg_to_v3,
     _normalize_tool_choice,
+    _v3_finish_reason,
     openai_to_v3,
     v3_to_openai,
     v3_stream_to_openai,
     v3_stream_iter,
     v3_sse_stream_to_openai,
-    _v3_finish_reason,
+    validate_tool_history,
+    responses_input_to_messages,
+    openai_to_responses,
+    openai_chunk_to_responses_sse,
+    _ResponsesStreamState,
+    v3_stream_to_responses_sse,
 )
+
+
+def async_iter(events):
+    async def gen():
+        for e in events:
+            yield e
+    return gen()
+
+
+def run_stream(events, **kwargs):
+    """Collect an async stream generator into a string (no async test dep)."""
+    return asyncio.run(_collect(events, kwargs))
+
+
+async def _collect(events, kwargs):
+    chunks = []
+    async for c in v3_stream_iter(async_iter(events), **kwargs):
+        chunks.append(c)
+    return "".join(chunks)
 
 
 # =====================================================================
@@ -52,30 +80,90 @@ class TestContentParts:
 
 
 # =====================================================================
-# Tool-call conversion (wire format)
+# Tool-call conversion (fx wire format: content parts, raw JSON input)
 # =====================================================================
 
 
 class TestToolCallConversion:
-    def test_string_args_passed_through(self):
+    def test_string_args_parsed_to_raw_object(self):
         tc = {"id": "call_1", "type": "function", "function": {"name": "read", "arguments": '{"path":"x"}'}}
         result = _openai_tool_call_to_v3(tc)
         assert result == {
+            "type": "tool-call",
             "toolCallId": "call_1",
             "toolName": "read",
-            "input": '{"path":"x"}',
+            "input": {"path": "x"},
         }
 
-    def test_object_args_stringified(self):
+    def test_object_args_passed_as_object(self):
         tc = {"id": "call_2", "type": "function", "function": {"name": "write", "arguments": {"path": "x", "content": "y"}}}
         result = _openai_tool_call_to_v3(tc)
-        assert result["input"] == '{"path": "x", "content": "y"}'
-        assert isinstance(result["input"], str)
+        assert result["input"] == {"path": "x", "content": "y"}
+        assert isinstance(result["input"], dict)
 
-    def test_invalid_args_defaults_to_empty(self):
+    def test_invalid_args_defaults_to_empty_object(self):
         tc = {"id": "call_3", "type": "function", "function": {"name": "x", "arguments": None}}
         result = _openai_tool_call_to_v3(tc)
-        assert result["input"] == "{}"
+        assert result["input"] == {}
+
+    def test_missing_type_treated_as_function(self):
+        tc = {"id": "call_4", "function": {"name": "f", "arguments": "{}"}}
+        result = _openai_tool_call_to_v3(tc)
+        assert result["type"] == "tool-call"
+        assert result["toolName"] == "f"
+
+
+class TestToolMsgConversion:
+    def test_string_output(self):
+        msg = {"role": "tool", "tool_call_id": "call_1", "content": "result text"}
+        result = _openai_tool_msg_to_v3(msg)
+        assert result["role"] == "tool"
+        assert result["content"] == [{
+            "type": "tool-result",
+            "toolCallId": "call_1",
+            "toolName": "unknown",
+            "output": {"type": "text", "value": "result text"},
+        }]
+
+    def test_default_tool_name_unknown(self):
+        msg = {"role": "tool", "tool_call_id": "call_1", "content": "x"}
+        assert _openai_tool_msg_to_v3(msg)["content"][0]["toolName"] == "unknown"
+
+    def test_name_from_message(self):
+        msg = {"role": "tool", "tool_call_id": "call_1", "name": "my_tool", "content": "x"}
+        assert _openai_tool_msg_to_v3(msg)["content"][0]["toolName"] == "my_tool"
+
+    def test_text_part_list(self):
+        msg = {"role": "tool", "tool_call_id": "call_1",
+               "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}
+        result = _openai_tool_msg_to_v3(msg)
+        assert result["content"][0]["output"]["value"] == "ab"
+
+
+class TestNormalizeToolChoice:
+    def test_string_auto(self):
+        assert _normalize_tool_choice("auto") == {"type": "auto"}
+
+    def test_string_none(self):
+        assert _normalize_tool_choice("none") == {"type": "none"}
+
+    def test_string_required(self):
+        assert _normalize_tool_choice("required") == {"type": "required"}
+
+    def test_unknown_string_defaults_auto(self):
+        assert _normalize_tool_choice("bogus") == {"type": "auto"}
+
+    def test_function_shape_to_tool(self):
+        assert _normalize_tool_choice({"type": "function", "function": {"name": "my_tool"}}) == {
+            "type": "tool", "toolName": "my_tool",
+        }
+
+    def test_v3_object_passthrough(self):
+        assert _normalize_tool_choice({"type": "auto"}) == {"type": "auto"}
+        assert _normalize_tool_choice({"type": "tool", "toolName": "x"}) == {"type": "tool", "toolName": "x"}
+
+    def test_none_defaults_auto(self):
+        assert _normalize_tool_choice(None) == {"type": "auto"}
 
 
 # =====================================================================
@@ -120,7 +208,7 @@ class TestOpenAIToV3:
             "inputSchema": {"type": "object"},
         }]
 
-    def test_assistant_tool_calls_use_top_level_toolCalls(self):
+    def test_assistant_tool_calls_are_content_parts(self):
         body = {
             "messages": [
                 {"role": "user", "content": "run"},
@@ -137,14 +225,31 @@ class TestOpenAIToV3:
         }
         result = openai_to_v3(body)
         assistant_msg = result["prompt"][1]
-        assert "toolCalls" in assistant_msg
-        assert assistant_msg["toolCalls"] == [{
-            "toolCallId": "call_1",
-            "toolName": "calc",
-            "input": '{"a":1}',
-        }]
-        # Must NOT be inside content as parts.
-        assert not any(p.get("type") == "tool-call" for p in assistant_msg["content"])
+        assert "toolCalls" not in assistant_msg
+        assert assistant_msg["content"] == [
+            {"type": "text", "text": ""},
+            {"type": "tool-call", "toolCallId": "call_1", "toolName": "calc", "input": {"a": 1}},
+        ]
+
+    def test_assistant_tool_call_with_text_content(self):
+        body = {
+            "messages": [
+                {"role": "user", "content": "go"},
+                {
+                    "role": "assistant",
+                    "content": "let me check",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }],
+                },
+            ],
+        }
+        result = openai_to_v3(body)
+        parts = result["prompt"][1]["content"]
+        assert parts[0] == {"type": "text", "text": "let me check"}
+        assert parts[1]["type"] == "tool-call"
 
     def test_tool_result_name_backfilled_from_prior_assistant(self):
         body = {
@@ -173,10 +278,10 @@ class TestOpenAIToV3:
         assert part["toolName"] == "my_tool"
         assert part["output"] == {"type": "text", "value": "result"}
 
-    def test_tool_result_no_prior_assistant_empty_name(self):
+    def test_tool_result_without_prior_call_defaults_unknown(self):
         body = {"messages": [{"role": "tool", "tool_call_id": "x", "content": "y"}]}
         result = openai_to_v3(body)
-        assert result["prompt"][0]["content"][0]["toolName"] == ""
+        assert result["prompt"][0]["content"][0]["toolName"] == "unknown"
 
     def test_param_passthrough(self):
         body = {"messages": [{"role": "user", "content": "x"}], "temperature": 0.7, "max_tokens": 50, "top_p": 0.9, "stop": "end"}
@@ -196,32 +301,167 @@ class TestOpenAIToV3:
         result = openai_to_v3(body)
         assert result["maxOutputTokens"] == 100
 
-    def test_tool_choice_string_auto_normalized(self):
-        body = {"messages": [{"role": "user", "content": "x"}], "tool_choice": "auto"}
-        assert openai_to_v3(body)["toolChoice"] == {"type": "auto"}
+    def test_tool_choice_normalization_via_body(self):
+        for raw, expected in [
+            ("auto", {"type": "auto"}),
+            ("none", {"type": "none"}),
+            ("required", {"type": "required"}),
+            ({"type": "function", "function": {"name": "t"}}, {"type": "tool", "toolName": "t"}),
+        ]:
+            body = {"messages": [{"role": "user", "content": "x"}], "tool_choice": raw}
+            assert openai_to_v3(body)["toolChoice"] == expected
 
-    def test_tool_choice_string_none_normalized(self):
-        body = {"messages": [{"role": "user", "content": "x"}], "tool_choice": "none"}
-        assert openai_to_v3(body)["toolChoice"] == {"type": "none"}
+    def test_response_format_json_object(self):
+        body = {"messages": [{"role": "user", "content": "x"}], "response_format": {"type": "json_object"}}
+        assert openai_to_v3(body)["responseFormat"] == {
+            "type": "json", "name": "", "description": "", "schema": {},
+        }
 
-    def test_tool_choice_string_required_normalized(self):
-        body = {"messages": [{"role": "user", "content": "x"}], "tool_choice": "required"}
-        assert openai_to_v3(body)["toolChoice"] == {"type": "required"}
+    def test_response_format_json_schema(self):
+        body = {"messages": [{"role": "user", "content": "x"}],
+                "response_format": {"type": "json_schema", "json_schema": {
+                    "name": "book", "description": "a book", "schema": {"type": "object"}}}}
+        assert openai_to_v3(body)["responseFormat"] == {
+            "type": "json", "name": "book", "description": "a book", "schema": {"type": "object"},
+        }
 
-    def test_tool_choice_unknown_string_defaults_auto(self):
-        assert _normalize_tool_choice("bogus") == {"type": "auto"}
-
-    def test_tool_choice_function_shape_to_tool(self):
-        tc = {"type": "function", "function": {"name": "my_tool"}}
-        assert _normalize_tool_choice(tc) == {"type": "tool", "toolName": "my_tool"}
-
-    def test_tool_choice_v3_object_passthrough(self):
-        tc = {"type": "auto"}
-        assert _normalize_tool_choice(tc) == {"type": "auto"}
-
-    def test_tool_choice_default_auto(self):
+    def test_response_format_absent(self):
         body = {"messages": [{"role": "user", "content": "x"}]}
-        assert openai_to_v3(body)["toolChoice"] == {"type": "auto"}
+        assert "responseFormat" not in openai_to_v3(body)
+
+    def test_reasoning_passthrough(self):
+        body = {"messages": [{"role": "user", "content": "x"}], "reasoning": {"effort": "high"}}
+        assert openai_to_v3(body)["reasoning"] == {"effort": "high"}
+
+    def test_reasoning_effort_mapping(self):
+        body = {"messages": [{"role": "user", "content": "x"}], "reasoning_effort": "minimal"}
+        assert openai_to_v3(body)["reasoning"] == "minimal"
+
+    def test_provider_options_passthrough(self):
+        body = {"messages": [{"role": "user", "content": "x"}],
+                "providerOptions": {"gateway": {"cache": "auto"}}}
+        assert openai_to_v3(body)["providerOptions"] == {"gateway": {"cache": "auto"}}
+
+    def test_provider_options_empty_omitted(self):
+        body = {"messages": [{"role": "user", "content": "x"}], "providerOptions": {}}
+        assert "providerOptions" not in openai_to_v3(body)
+
+    def test_input_body_not_mutated(self):
+        import copy
+        body = {"messages": [{"role": "user", "content": "x"}], "tool_choice": "auto"}
+        snapshot = copy.deepcopy(body)
+        openai_to_v3(body)
+        assert body == snapshot
+
+
+# =====================================================================
+# validate_tool_history
+# =====================================================================
+
+
+class TestValidateToolHistory:
+    def _call(self, call_id="call_1", name="calc", args="{}"):
+        return {"id": call_id, "type": "function",
+                "function": {"name": name, "arguments": args}}
+
+    def test_valid_single_round(self):
+        messages = [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": None, "tool_calls": [self._call()]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "42"},
+            {"role": "user", "content": "thanks"},
+        ]
+        assert validate_tool_history(messages) is None
+
+    def test_valid_multi_call_parallel(self):
+        messages = [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                self._call("call_1", "calc"),
+                self._call("call_2", "search"),
+            ]},
+            {"role": "tool", "tool_call_id": "call_2", "content": "b"},
+            {"role": "tool", "tool_call_id": "call_1", "content": "a"},
+        ]
+        assert validate_tool_history(messages) is None
+
+    def test_valid_two_rounds(self):
+        messages = [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": None, "tool_calls": [self._call("call_1")]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "42"},
+            {"role": "assistant", "content": None, "tool_calls": [self._call("call_2", "step2")]},
+            {"role": "tool", "tool_call_id": "call_2", "content": "x"},
+        ]
+        assert validate_tool_history(messages) is None
+
+    def test_no_tools_is_valid(self):
+        assert validate_tool_history([{"role": "user", "content": "hi"}]) is None
+
+    def test_orphan_tool_result_rejected(self):
+        messages = [{"role": "user", "content": "go"}, {"role": "tool", "tool_call_id": "x", "content": "y"}]
+        err = validate_tool_history(messages)
+        assert err is not None and "no preceding assistant" in err
+
+    def test_missing_results_rejected(self):
+        messages = [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": None, "tool_calls": [self._call()]},
+        ]
+        err = validate_tool_history(messages)
+        assert err is not None and "no matching tool results" in err
+
+    def test_unmatched_result_id_rejected(self):
+        messages = [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": None, "tool_calls": [self._call("call_1")]},
+            {"role": "tool", "tool_call_id": "other", "content": "y"},
+        ]
+        err = validate_tool_history(messages)
+        assert err is not None and "unknown tool call" in err
+
+    def test_duplicate_tool_call_id_rejected(self):
+        messages = [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                self._call("call_1"), self._call("call_1"),
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "a"},
+            {"role": "tool", "tool_call_id": "call_1", "content": "b"},
+        ]
+        err = validate_tool_history(messages)
+        assert err is not None and "duplicate tool call id" in err
+
+    def test_invalid_json_args_rejected(self):
+        messages = [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                self._call("call_1", args="not json"),
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "y"},
+        ]
+        err = validate_tool_history(messages)
+        assert err is not None and "not valid JSON" in err
+
+    def test_empty_arguments_rejected(self):
+        messages = [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                self._call("call_1", args=""),
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "y"},
+        ]
+        err = validate_tool_history(messages)
+        assert err is not None and "empty" in err
+
+    def test_missing_tool_name_rejected(self):
+        messages = [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": None, "tool_calls": [self._call(name="")]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "y"},
+        ]
+        err = validate_tool_history(messages)
+        assert err is not None and "missing a function name" in err
 
 
 # =====================================================================
@@ -239,23 +479,6 @@ class TestV3ToOpenAI:
         assert choice["finish_reason"] == "stop"
         assert result["object"] == "chat.completion"
 
-    def test_tool_calls_from_top_level_toolCalls(self):
-        v3 = {
-            "content": [],
-            "toolCalls": [{
-                "toolCallId": "call_1",
-                "toolName": "calc",
-                "input": '{"a":1}',
-            }],
-            "finishReason": "tool_calls",
-        }
-        result = v3_to_openai(v3, model="gpt-4")
-        msg = result["choices"][0]["message"]
-        assert msg["content"] is None
-        assert len(msg["tool_calls"]) == 1
-        assert msg["tool_calls"][0]["function"]["name"] == "calc"
-        assert msg["tool_calls"][0]["id"] == "call_1"
-
     def test_tool_calls_from_content_parts(self):
         v3 = {
             "content": [{
@@ -270,6 +493,33 @@ class TestV3ToOpenAI:
         tc = result["choices"][0]["message"]["tool_calls"][0]
         assert tc["function"]["name"] == "web_fetch"
         assert tc["function"]["arguments"] == '{"url": "https://example.com"}'
+
+    def test_tool_calls_from_top_level_toolCalls(self):
+        v3 = {
+            "content": [],
+            "toolCalls": [{"toolCallId": "call_1", "toolName": "calc", "input": {"a": 1}}],
+            "finishReason": "tool_calls",
+        }
+        result = v3_to_openai(v3, model="gpt-4")
+        msg = result["choices"][0]["message"]
+        assert msg["content"] is None
+        assert len(msg["tool_calls"]) == 1
+        assert msg["tool_calls"][0]["function"]["name"] == "calc"
+        assert msg["tool_calls"][0]["id"] == "call_1"
+
+    def test_tool_calls_from_openai_style(self):
+        v3 = {
+            "content": [],
+            "tool_calls": [{
+                "id": "call_9", "type": "function",
+                "function": {"name": "f", "arguments": "{}"},
+            }],
+            "finishReason": "tool_calls",
+        }
+        result = v3_to_openai(v3)
+        tc = result["choices"][0]["message"]["tool_calls"][0]
+        assert tc["id"] == "call_9"
+        assert tc["function"]["name"] == "f"
 
     def test_finish_reason_map(self):
         assert _v3_finish_reason("stop") == "stop"
@@ -300,19 +550,6 @@ class TestV3ToOpenAI:
 
 
 # =====================================================================
-# Finish reason mapping (explicit edge cases)
-# =====================================================================
-
-
-class TestFinishReason:
-    def test_snake_case(self):
-        assert _v3_finish_reason("content_filter") == "content_filter"
-
-    def test_hyphen_case(self):
-        assert _v3_finish_reason("content-filter") == "content_filter"
-
-
-# =====================================================================
 # Streaming conversion
 # =====================================================================
 
@@ -334,10 +571,39 @@ class TestStreaming:
         assert "lo" in sse
         assert "data: [DONE]" in sse
 
+    def test_stream_finish_carries_usage(self):
+        events = [
+            {"type": "text-delta", "delta": "x"},
+            {"type": "finish", "finishReason": "stop", "usage": {"inputTokens": {"total": 3}, "outputTokens": {"total": 2}}},
+        ]
+        sse = v3_stream_to_openai(events)
+        finish_chunk = None
+        for line in sse.split("\n\n"):
+            if line.startswith("data: ") and "[DONE]" not in line:
+                obj = json.loads(line[6:])
+                if obj["choices"][0]["finish_reason"] == "stop":
+                    finish_chunk = obj
+        assert finish_chunk is not None
+        assert finish_chunk["usage"] == {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+
+    def test_stream_no_usage_when_disabled(self):
+        events = [
+            {"type": "text-delta", "delta": "x"},
+            {"type": "finish", "finishReason": "stop", "usage": {"inputTokens": {"total": 3}, "outputTokens": {"total": 2}}},
+        ]
+        sse = v3_stream_to_openai(events, include_usage=False)
+        for line in sse.split("\n\n"):
+            if line.startswith("data: ") and "[DONE]" not in line:
+                obj = json.loads(line[6:])
+                if obj["choices"][0]["finish_reason"] == "stop":
+                    assert "usage" not in obj
+                    return
+        assert False, "finish chunk not found"
+
     def test_stream_multiple_tool_calls_sequential_indices(self):
         events = [
-            {"type": "tool-call", "toolCallId": "call_1", "toolName": "read", "input": "{}"},
-            {"type": "tool-call", "toolCallId": "call_2", "toolName": "write", "input": "{}"},
+            {"type": "tool-call", "toolCallId": "call_1", "toolName": "read", "input": {}},
+            {"type": "tool-call", "toolCallId": "call_2", "toolName": "write", "input": {}},
             {"type": "finish", "finishReason": "tool-calls"},
         ]
         sse = v3_stream_to_openai(events)
@@ -356,7 +622,7 @@ class TestStreaming:
         assert tool_chunks == [0, 1], f"expected sequential indices, got {tool_chunks}"
 
     def test_stream_tool_input_delta_accumulation(self):
-        delta1 = '{"a"},'
+        delta1 = '{"a":'
         delta2 = '"b":2}'
         events = [
             {"type": "tool-input-delta", "toolCallId": "call_1", "delta": delta1},
@@ -367,24 +633,29 @@ class TestStreaming:
         sse = v3_stream_to_openai(events)
         for line in sse.split("\n\n"):
             if line.startswith("data: "):
-                try:
-                    obj = json.loads(line[6:])
-                    tc = obj["choices"][0]["delta"].get("tool_calls", [])
-                    if tc and tc[0].get("function", {}).get("name") == "calc":
-                        assert tc[0]["function"]["arguments"] == delta1 + delta2
-                        return
-                except (json.JSONDecodeError, KeyError):
-                    pass
+                obj = json.loads(line[6:])
+                tc = obj["choices"][0]["delta"].get("tool_calls", [])
+                if tc and tc[0].get("function", {}).get("name") == "calc":
+                    assert tc[0]["function"]["arguments"] == delta1 + delta2
+                    return
         assert False, "tool-call chunk not found"
 
-    def test_stream_iter_generates_same_chunks(self):
+    def test_stream_async_iter_matches_sync(self):
         events = [
             {"type": "text-delta", "delta": "hi"},
             {"type": "finish", "finishReason": "stop"},
         ]
-        chunks = list(v3_stream_iter(iter(events)))
-        sse = "".join(chunks)
+        sse = run_stream(events)
         assert "hi" in sse
+        assert "data: [DONE]" in sse
+
+    def test_stream_error_event(self):
+        events = [
+            {"type": "error", "error": {"message": "boom"}},
+        ]
+        sse = v3_stream_to_openai(events)
+        assert '"type": "error"' in sse
+        assert "boom" in sse
         assert "data: [DONE]" in sse
 
 
@@ -408,7 +679,7 @@ class TestNonStreamingCollection:
 
     def test_collects_tool_calls(self):
         events = [
-            {"type": "tool-call", "toolCallId": "call_1", "toolName": "run", "input": "{}"},
+            {"type": "tool-call", "toolCallId": "call_1", "toolName": "run", "input": {}},
             {"type": "finish", "finishReason": "tool-calls"},
         ]
         result = v3_sse_stream_to_openai(iter(events))
@@ -430,3 +701,193 @@ class TestNonStreamingCollection:
         result = v3_sse_stream_to_openai(iter([]))
         assert result["choices"][0]["message"]["content"] == ""
         assert result["choices"][0]["finish_reason"] == "stop"
+
+
+# =====================================================================
+# Responses API translation
+# =====================================================================
+
+
+class TestResponsesInputToMessages:
+    def test_flat_user_message(self):
+        messages = responses_input_to_messages([{"role": "user", "content": "hi"}])
+        assert messages == [{"role": "user", "content": "hi"}]
+
+    def test_typed_message_item_with_text_blocks(self):
+        messages = responses_input_to_messages([
+            {"type": "message", "role": "assistant", "content": [
+                {"type": "output_text", "text": "hello", "annotations": []},
+            ]},
+        ])
+        assert messages == [{"role": "assistant", "content": "hello"}]
+
+    def test_function_call_and_output(self):
+        messages = responses_input_to_messages([
+            {"type": "message", "role": "user", "content": "go"},
+            {"type": "function_call", "call_id": "call_1", "name": "calc", "arguments": '{"a":1}'},
+            {"type": "function_call_output", "call_id": "call_1", "output": "42"},
+        ])
+        assert messages == [
+            {"role": "user", "content": "go"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": "calc", "arguments": '{"a":1}'},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "42"},
+        ]
+
+    def test_outputs_must_follow_their_call_batch(self):
+        messages = responses_input_to_messages([
+            {"type": "function_call", "call_id": "c1", "name": "a", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c1", "output": "1"},
+            {"type": "function_call", "call_id": "c2", "name": "b", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c2", "output": "2"},
+        ])
+        # First call block + result, then second call block + result.
+        assert [m["role"] for m in messages] == ["assistant", "tool", "assistant", "tool"]
+        assert validate_tool_history(messages) is None
+
+    def test_empty_input(self):
+        assert responses_input_to_messages(None) == []
+        assert responses_input_to_messages([]) == []
+
+
+class TestOpenAIToResponses:
+    def test_text_output(self):
+        openai_resp = {
+            "model": "gpt-4",
+            "choices": [{"message": {"role": "assistant", "content": "hi"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+        }
+        result = openai_to_responses(openai_resp, model="gpt-4")
+        assert result["object"] == "response"
+        assert result["status"] == "completed"
+        assert result["output"][0]["type"] == "message"
+        assert result["output"][0]["content"] == [{"type": "output_text", "text": "hi", "annotations": []}]
+        assert result["usage"]["total_tokens"] == 3
+
+    def test_tool_call_output(self):
+        openai_resp = {
+            "choices": [{"message": {
+                "role": "assistant", "content": None,
+                "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": "calc", "arguments": '{"a":1}'},
+                }],
+            }}],
+        }
+        result = openai_to_responses(openai_resp)
+        assert result["output"][0]["type"] == "function_call"
+        assert result["output"][0]["call_id"] == "call_1"
+        assert result["output"][0]["name"] == "calc"
+        assert result["output"][0]["status"] == "completed"
+
+    def test_text_and_tool_both(self):
+        openai_resp = {
+            "choices": [{"message": {
+                "role": "assistant", "content": "checking",
+                "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": "f", "arguments": "{}"},
+                }],
+            }}],
+        }
+        result = openai_to_responses(openai_resp)
+        assert [o["type"] for o in result["output"]] == ["message", "function_call"]
+
+
+class TestResponsesStreaming:
+    def _chunk(self, **kw):
+        return f"data: {json.dumps(kw)}\n\n"
+
+    def test_stream_text(self):
+        state = _ResponsesStreamState("gpt-4")
+        chunk = self._chunk(
+            id="x", object="chat.completion.chunk",
+            choices=[{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+        )
+        out = openai_chunk_to_responses_sse(chunk, state)
+        assert json.loads(out.split("\n\n")[0][6:])["type"] == "response.created"
+        assert "response.output_item.added" in out
+        assert "response.content_part.added" in out
+
+        out = openai_chunk_to_responses_sse(
+            self._chunk(choices=[{"index": 0, "delta": {"content": "hello"}, "finish_reason": None}]),
+            state,
+        )
+        ev = json.loads(out.split("\n\n")[0][6:])
+        assert ev["type"] == "response.output_text.delta"
+        assert ev["delta"] == "hello"
+
+        out = openai_chunk_to_responses_sse(
+            self._chunk(choices=[{"index": 0, "delta": {}, "finish_reason": "stop"}], usage={}),
+            state,
+        )
+        assert "response.completed" in out
+        final = json.loads([l for l in out.split("\n\n") if l.startswith("data:")]
+                           [-1][6:])
+        assert final["response"]["status"] == "completed"
+        assert final["response"]["output"][0]["content"][0]["text"] == "hello"
+
+    def test_stream_tool_call(self):
+        state = _ResponsesStreamState("gpt-4")
+        openai_chunk_to_responses_sse(
+            self._chunk(choices=[{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]),
+            state,
+        )
+        out = openai_chunk_to_responses_sse(
+            self._chunk(choices=[{"index": 0, "delta": {"tool_calls": [{
+                "index": 0, "id": "call_1", "type": "function",
+                "function": {"name": "calc", "arguments": '{"a": 1}'},
+            }]}, "finish_reason": None}]),
+            state,
+        )
+        assert "response.output_item.added" in out
+        assert "response.function_call_arguments.delta" in out
+
+        out = openai_chunk_to_responses_sse(
+            self._chunk(choices=[{"index": 0, "delta": {}, "finish_reason": "tool_calls"}], usage={}),
+            state,
+        )
+        assert "response.completed" in out
+        final = json.loads([l for l in out.split("\n\n") if l.startswith("data:")][-1][6:])
+        fc = final["response"]["output"][0]
+        assert fc["type"] == "function_call"
+        assert fc["call_id"] == "call_1"
+        assert fc["name"] == "calc"
+        assert fc["status"] == "completed"
+
+    def test_done_passthrough(self):
+        state = _ResponsesStreamState("gpt-4")
+        out = openai_chunk_to_responses_sse("data: [DONE]\n\n", state)
+        assert out == "data: [DONE]\n\n"
+
+    def test_error_event(self):
+        state = _ResponsesStreamState("gpt-4")
+        out = openai_chunk_to_responses_sse(
+            self._chunk(type="error", error={"message": "boom"}), state)
+        assert "response.failed" in out
+        assert "boom" in out
+
+    def test_offline_v3_to_responses(self):
+        events = [
+            {"type": "text-delta", "delta": "Hello"},
+            {"type": "tool-call", "toolCallId": "call_1", "toolName": "calc", "input": {"a": 1}},
+            {"type": "finish", "finishReason": "tool-calls",
+             "usage": {"inputTokens": {"total": 5}, "outputTokens": {"total": 7}}},
+        ]
+        sse = v3_stream_to_responses_sse(events, model="gpt-4")
+        assert "response.created" in sse
+        assert "response.output_text.delta" in sse
+        assert "response.function_call_arguments.delta" in sse
+        assert "response.completed" in sse
+        assert sse.rstrip().endswith("data: [DONE]")
+        final = json.loads(
+            [l for l in sse.split("\n\n")
+             if l.startswith("data: ") and "[DONE]" not in l][-1][6:]
+        )
+        assert final["response"]["usage"]["total_tokens"] == 12

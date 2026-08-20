@@ -1,9 +1,9 @@
 """
 fx-style AI Gateway proxy — v3 AI SDK protocol.
 
-Exposes OpenAI-compatible endpoints (/v1/chat/completions, /v1/models)
-and forwards to the Vercel AI Gateway using the **same v3 AI SDK protocol**
-the native fx CLI uses:
+Exposes OpenAI-compatible endpoints (/v1/chat/completions, /v1/models,
+/v1/responses, /v1/embeddings) and forwards to the Vercel AI Gateway using
+the **same v3 AI SDK protocol** the native fx CLI uses:
 
     POST https://ai-gateway.vercel.sh/v3/ai/language-model
 
@@ -18,14 +18,21 @@ the native fx CLI uses:
       ai-language-model-streaming: true
 
     Body (AI SDK v3 format):
-      {prompt, tools, toolChoice, headers}
+      {prompt, tools, toolChoice, responseFormat, reasoning, providerOptions}
 
-The proxy translates incoming OpenAI-format requests to AI SDK v3 format
-via `converter.openai_to_v3` and converts the v3 SSE stream back to
-OpenAI-format chunks via `converter.v3_sse_stream_to_openai` (non-stream)
-and the streaming helper below (stream).
+The proxy translates incoming OpenAI-format requests to AI SDK v3 format via
+`converter.openai_to_v3` and converts the v3 SSE stream back to OpenAI-format
+chunks via `converter.v3_stream_iter` (stream) or
+`converter.v3_sse_stream_to_openai` (non-stream).
 
-Authenticates incoming requests with a proxy API key (PROXY_API_KEY env var).
+Features beyond plain forwarding:
+  * client-side tool-history validation (clear 400s instead of opaque
+    gateway "Invalid input" errors)
+  * upstream error bodies normalized to the OpenAI error shape
+  * upstream stream cancelled when the client disconnects
+  * optional usage reporting on the final streaming chunk
+  * configurable upstream timeouts, HTTP/2, and model-list caching
+  * request logging
 """
 
 from __future__ import annotations
@@ -54,10 +61,13 @@ from fastapi.responses import StreamingResponse, JSONResponse
 
 from converter import (
     openai_to_v3,
-    _sse_chunk,
-    _v3_finish_reason,
-    _v3_usage_to_openai,
+    validate_tool_history,
+    v3_stream_iter,
     v3_sse_stream_to_openai,
+    responses_input_to_messages,
+    openai_to_responses,
+    openai_chunk_to_responses_sse,
+    _ResponsesStreamState,
 )
 
 # --------------------------------------------------------------------------- #
@@ -69,6 +79,13 @@ GATEWAY_API_KEY = os.getenv("AI_GATEWAY_API_KEY", "")
 GATEWAY_TEAM = os.getenv("GATEWAY_TEAM", "")
 PROXY_API_KEY = os.getenv("PROXY_API_KEY", "")
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "zai/glm-5.2")
+
+GATEWAY_TIMEOUT_CONNECT = float(os.getenv("GATEWAY_TIMEOUT_CONNECT", "15"))
+GATEWAY_TIMEOUT_READ = float(os.getenv("GATEWAY_TIMEOUT_READ", "300"))
+GATEWAY_TIMEOUT_WRITE = float(os.getenv("GATEWAY_TIMEOUT_WRITE", "60"))
+GATEWAY_TIMEOUT_POOL = float(os.getenv("GATEWAY_TIMEOUT_POOL", "60"))
+GATEWAY_HTTP2 = os.getenv("GATEWAY_HTTP2", "1").lower() in ("1", "true", "yes")
+MODELS_CACHE_TTL = float(os.getenv("MODELS_CACHE_TTL", "300"))
 
 GATEWAY_V3_CHAT = "/v3/ai/language-model"
 GATEWAY_V1_MODELS = "/v1/models"
@@ -82,15 +99,29 @@ log = logging.getLogger("gateway-proxy")
 bearer = HTTPBearer(auto_error=False)
 
 
+def _build_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        timeout=httpx.Timeout(
+            connect=GATEWAY_TIMEOUT_CONNECT,
+            read=GATEWAY_TIMEOUT_READ,
+            write=GATEWAY_TIMEOUT_WRITE,
+            pool=GATEWAY_TIMEOUT_POOL,
+        ),
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+        http2=GATEWAY_HTTP2,
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    client = httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=15.0, read=300.0, write=60.0, pool=60.0),
-        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
-        http2=True,
-    )
-    app.state.client = client
-    log.info("proxy ready  gateway=%s  default_model=%s", GATEWAY_BASE_URL, DEFAULT_MODEL)
+    # Reuse a client that was injected ahead of time (e.g. by tests).
+    if getattr(app.state, "client", None) is None:
+        app.state.client = _build_client()
+    if not hasattr(app.state, "models_cache"):
+        app.state.models_cache = {"data": None, "expires": 0.0}
+    client: httpx.AsyncClient = app.state.client
+    log.info("proxy ready  gateway=%s  default_model=%s  http2=%s",
+             GATEWAY_BASE_URL, DEFAULT_MODEL, GATEWAY_HTTP2)
     if not GATEWAY_API_KEY:
         log.warning("AI_GATEWAY_API_KEY not set — upstream will reject requests")
     if not PROXY_API_KEY:
@@ -100,6 +131,25 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="fx-style AI Gateway proxy", lifespan=lifespan)
+
+
+# --------------------------------------------------------------------------- #
+# Request logging middleware
+# --------------------------------------------------------------------------- #
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start = time.monotonic()
+    try:
+        response = await call_next(request)
+    except Exception:
+        log.exception("%s %s failed", request.method, request.url.path)
+        raise
+    duration_ms = (time.monotonic() - start) * 1000
+    log.info("%s %s -> %d (%.0fms)", request.method, request.url.path,
+             response.status_code, duration_ms)
+    return response
 
 
 # --------------------------------------------------------------------------- #
@@ -164,111 +214,105 @@ def _parse_sse_line(line: str) -> str | None:
     return stripped
 
 
-def _client_error(resp: httpx.Response) -> JSONResponse:
-    try:
-        body = resp.json()
-    except Exception:
-        body = {"error": {"message": resp.text, "type": "upstream_error"}}
-    return JSONResponse(status_code=resp.status_code, content=body)
-
-
-def _usage_or_none(usage_data: dict) -> dict | None:
-    if not usage_data:
-        return None
-    return _v3_usage_to_openai(usage_data)
-
-
-# --------------------------------------------------------------------------- #
-# Streaming response generator
-# --------------------------------------------------------------------------- #
-
-
-async def _stream_response(resp: httpx.Response, model: str) -> AsyncIterator[str]:
-    """Consume the upstream v3 SSE stream line-by-line and yield OpenAI SSE chunks."""
-    chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
-    yield _sse_chunk(chat_id, model, role="assistant")
-
-    tool_input_buffers: dict[str, str] = {}
-    tool_call_index: dict[str, int] = {}
-    next_tool_index = 0
-
-    async for raw in resp.aiter_lines():
+async def _v3_lines_to_events(lines: AsyncIterator[str]) -> AsyncIterator[dict]:
+    """Parse raw upstream SSE lines into event dicts."""
+    async for raw in lines:
         data = _parse_sse_line(raw)
         if data is None:
             continue
         try:
-            event = json.loads(data)
+            yield json.loads(data)
         except json.JSONDecodeError:
             continue
 
-        etype = event.get("type", "")
 
-        if etype == "text-delta":
-            delta = event.get("delta", "")
-            if delta:
-                yield _sse_chunk(chat_id, model, delta_text=delta)
+def _client_error(resp: httpx.Response) -> JSONResponse:
+    """Normalize an upstream error into an OpenAI-shaped error body."""
+    try:
+        body = resp.json()
+    except Exception:
+        body = None
+    if isinstance(body, dict) and "error" in body:
+        return JSONResponse(status_code=resp.status_code, content=body)
+    message = None
+    if isinstance(body, dict):
+        message = body.get("message") or json.dumps(body)[:2000]
+    if not message:
+        message = (resp.text or f"upstream error (HTTP {resp.status_code})")[:2000]
+    return JSONResponse(status_code=resp.status_code, content={
+        "error": {"message": message, "type": "upstream_error"},
+    })
 
-        elif etype == "tool-input-delta":
-            tool_id = event.get("toolCallId", "") or event.get("id", "")
-            if tool_id:
-                tool_input_buffers[tool_id] = tool_input_buffers.get(tool_id, "") + event.get("delta", "")
 
-        elif etype == "tool-call":
-            tool_id = event.get("toolCallId", "") or event.get("id", "")
-            tool_name = event.get("toolName", "")
-            tool_args = event.get("input", "") or tool_input_buffers.get(tool_id, "")
-            if not isinstance(tool_args, str):
-                try:
-                    tool_args = json.dumps(tool_args)
-                except (TypeError, ValueError):
-                    tool_args = ""
-            tool_args = tool_args or tool_input_buffers.get(tool_id, "")
+def _invalid_request(message: str) -> JSONResponse:
+    return JSONResponse(status_code=400, content={
+        "error": {"message": message, "type": "invalid_request_error"},
+    })
 
-            idx = tool_call_index.get(tool_id)
-            if idx is None:
-                idx = next_tool_index
-                tool_call_index[tool_id] = idx
-                next_tool_index += 1
 
-            chunk = {
-                "id": chat_id,
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {
-                        "tool_calls": [{
-                            "index": idx,
-                            "id": tool_id,
-                            "type": "function",
-                            "function": {"name": tool_name, "arguments": tool_args},
-                        }]
-                    },
-                    "finish_reason": None,
-                }],
-            }
-            yield f"data: {json.dumps(chunk)}\n\n"
-            tool_input_buffers.pop(tool_id, None)
+def _warn_dropped_params(body: dict) -> None:
+    """The gateway only supports the mapped params; log anything we drop."""
+    unsupported = ("seed", "logprobs", "top_logprobs", "presence_penalty",
+                   "frequency_penalty", "user", "logit_bias")
+    for key in unsupported:
+        if key in body:
+            log.warning("dropping unsupported request param: %s", key)
+    if body.get("n", 1) != 1:
+        log.warning("n=%s unsupported by the gateway; forcing 1", body.get("n"))
 
-        elif etype == "finish":
-            yield _sse_chunk(
-                chat_id, model,
-                finish_reason=_v3_finish_reason(event.get("finishReason", "stop")),
-                usage=_usage_or_none(event.get("usage", {})),
-            )
-            break
 
-        elif etype == "error":
-            yield _sse_chunk(chat_id, model, finish_reason="stop")
-            break
+async def _parse_body(request: Request) -> dict:
+    try:
+        body = await request.json()
+    except Exception:
+        return {}
+    return body if isinstance(body, dict) else {}
 
-    yield "data: [DONE]\n\n"
+
+async def _send_upstream(
+    client: httpx.AsyncClient, url: str, headers: dict, v3_body: dict
+) -> httpx.Response:
+    req = client.build_request("POST", url, headers=headers, json=v3_body)
+    resp = await client.send(req, stream=True)
+    if resp.status_code != 200:
+        await resp.aread()
+    return resp
 
 
 # --------------------------------------------------------------------------- #
-# Non-streaming response collector
+# Streaming response generators
 # --------------------------------------------------------------------------- #
+
+
+async def _chat_stream(
+    resp: httpx.Response, model: str, include_usage: bool
+) -> AsyncIterator[str]:
+    """Consume the upstream v3 stream and yield OpenAI SSE chunks.
+
+    The upstream response is closed in a finally block, so if the client
+    disconnects (generator cancelled) the upstream request is cancelled too.
+    """
+    try:
+        async for chunk in v3_stream_iter(
+            _v3_lines_to_events(resp.aiter_lines()), model, include_usage
+        ):
+            yield chunk
+    finally:
+        await resp.aclose()
+
+
+async def _responses_stream(resp: httpx.Response, model: str) -> AsyncIterator[str]:
+    """Consume the upstream v3 stream and yield Responses API SSE events."""
+    state = _ResponsesStreamState(model)
+    try:
+        async for chunk in v3_stream_iter(
+            _v3_lines_to_events(resp.aiter_lines()), model, include_usage=True
+        ):
+            out = openai_chunk_to_responses_sse(chunk, state)
+            if out:
+                yield out
+    finally:
+        await resp.aclose()
 
 
 async def _collect_response(resp: httpx.Response, model: str) -> dict:
@@ -297,6 +341,12 @@ async def healthz():
 @app.get("/v1/models")
 async def list_models(_: str = Depends(verify_proxy_key)):
     client = _get_client()
+    cache: dict = getattr(app.state, "models_cache", {})
+    now = time.monotonic()
+    if cache.get("expires", 0) > now and cache.get("data") is not None:
+        log.info("GET /v1/models -> cached (%d models)", len(cache["data"].get("data", [])))
+        return JSONResponse(content=cache["data"])
+
     url = urljoin(GATEWAY_BASE_URL + "/", GATEWAY_V1_MODELS.lstrip("/"))
     headers = {"Accept": "application/json"}
     if GATEWAY_API_KEY:
@@ -304,7 +354,12 @@ async def list_models(_: str = Depends(verify_proxy_key)):
     resp = await client.get(url, headers=headers)
     if resp.status_code != 200:
         return _client_error(resp)
-    return JSONResponse(content=resp.json())
+    data = resp.json()
+    cache["data"] = data
+    cache["expires"] = now + MODELS_CACHE_TTL
+    log.info("GET /v1/models -> upstream (%d models, cached %.0fs)",
+             len(data.get("data", [])), MODELS_CACHE_TTL)
+    return JSONResponse(content=data)
 
 
 @app.post("/v1/chat/completions")
@@ -312,53 +367,118 @@ async def chat_completions(request: Request, _: str = Depends(verify_proxy_key))
     """Proxy chat completions via the v3 AI SDK endpoint."""
     client = _get_client()
 
-    try:
-        body = await request.json()
-    except Exception:
+    body = await _parse_body(request)
+    if not body:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
     model = body.get("model") or DEFAULT_MODEL
+    if not isinstance(model, str) or not model:
+        return _invalid_request("model is required")
+
+    # Client-side validation: catch bad tool histories before the gateway
+    # rejects them with an opaque "Invalid input".
+    err = validate_tool_history(body.get("messages", []))
+    if err:
+        log.warning("rejected request: %s", err)
+        return _invalid_request(f"Invalid messages: {err}")
+
+    _warn_dropped_params(body)
+
     stream = bool(body.get("stream", False))
+    stream_options = body.get("stream_options")
+    include_usage = bool(
+        (stream_options or {}).get("include_usage", True)
+        if isinstance(stream_options, dict) else True
+    )
 
     v3_body = openai_to_v3(body)
     url = urljoin(GATEWAY_BASE_URL + "/", GATEWAY_V3_CHAT.lstrip("/"))
     headers = _v3_headers(model, streaming=True)
 
     if stream:
-        req = client.build_request("POST", url, headers=headers, json=v3_body)
-        resp = await client.send(req, stream=True)
+        resp = await _send_upstream(client, url, headers, v3_body)
         if resp.status_code != 200:
-            await resp.aread()
-            err = _client_error(resp)
+            err_resp = _client_error(resp)
             await resp.aclose()
-            return err
+            return err_resp
         return StreamingResponse(
-            _stream_response(resp, model),
+            _chat_stream(resp, model, include_usage),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
-    else:
-        req = client.build_request("POST", url, headers=headers, json=v3_body)
-        resp = await client.send(req, stream=True)
-        if resp.status_code != 200:
-            await resp.aread()
-            err = _client_error(resp)
-            await resp.aclose()
-            return err
 
-        try:
-            result = await _collect_response(resp, model)
-        finally:
+    resp = await _send_upstream(client, url, headers, v3_body)
+    if resp.status_code != 200:
+        err_resp = _client_error(resp)
+        await resp.aclose()
+        return err_resp
+    try:
+        result = await _collect_response(resp, model)
+    finally:
+        await resp.aclose()
+    return JSONResponse(content=result)
+
+
+@app.post("/v1/responses")
+async def responses_route(request: Request, _: str = Depends(verify_proxy_key)):
+    """Proxy the OpenAI Responses API (input items) via the v3 endpoint."""
+    client = _get_client()
+
+    body = await _parse_body(request)
+    if not body:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    model = body.get("model") or DEFAULT_MODEL
+    if not isinstance(model, str) or not model:
+        return _invalid_request("model is required")
+
+    messages = responses_input_to_messages(body.get("input"))
+    err = validate_tool_history(messages)
+    if err:
+        log.warning("rejected /v1/responses request: %s", err)
+        return _invalid_request(f"Invalid input: {err}")
+
+    _warn_dropped_params(body)
+
+    stream = bool(body.get("stream", False))
+    chat_body = dict(body)
+    chat_body["messages"] = messages
+    chat_body.pop("input", None)
+    chat_body.pop("stream", None)
+
+    v3_body = openai_to_v3(chat_body)
+    url = urljoin(GATEWAY_BASE_URL + "/", GATEWAY_V3_CHAT.lstrip("/"))
+    headers = _v3_headers(model, streaming=True)
+
+    if stream:
+        resp = await _send_upstream(client, url, headers, v3_body)
+        if resp.status_code != 200:
+            err_resp = _client_error(resp)
             await resp.aclose()
-        return JSONResponse(content=result)
+            return err_resp
+        return StreamingResponse(
+            _responses_stream(resp, model),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    resp = await _send_upstream(client, url, headers, v3_body)
+    if resp.status_code != 200:
+        err_resp = _client_error(resp)
+        await resp.aclose()
+        return err_resp
+    try:
+        result = await _collect_response(resp, model)
+    finally:
+        await resp.aclose()
+    return JSONResponse(content=openai_to_responses(result, model))
 
 
 @app.post("/v1/embeddings")
 async def embeddings(request: Request, _: str = Depends(verify_proxy_key)):
     client = _get_client()
-    try:
-        body = await request.json()
-    except Exception:
+    body = await _parse_body(request)
+    if not body:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
     model = body.get("model") or "openai/text-embedding-3-large"
