@@ -32,14 +32,23 @@ def _v3_finish_reason(v3_reason) -> str:
 
 def _v3_usage_to_openai(usage_data: dict) -> dict:
     pt = usage_data.get("inputTokens", {})
-    prompt_tokens = pt.get("total", 0) if isinstance(pt, dict) else (pt or 0)
+    prompt_total = pt.get("total", 0) if isinstance(pt, dict) else (pt or 0)
     ct = usage_data.get("outputTokens", {})
-    completion_tokens = ct.get("total", 0) if isinstance(ct, dict) else (ct or 0)
-    return {
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": prompt_tokens + completion_tokens,
+    completion_total = ct.get("total", 0) if isinstance(ct, dict) else (ct or 0)
+    result: dict = {
+        "prompt_tokens": prompt_total,
+        "completion_tokens": completion_total,
+        "total_tokens": prompt_total + completion_total,
     }
+    if isinstance(pt, dict):
+        cache_read = pt.get("cacheRead")
+        if cache_read is not None:
+            result["prompt_tokens_details"] = {"cached_tokens": cache_read}
+    if isinstance(ct, dict):
+        reasoning = ct.get("reasoning")
+        if reasoning is not None:
+            result["output_tokens_details"] = {"reasoning_tokens": reasoning}
+    return result
 
 
 def v3_to_openai(v3_data: dict, model: str = "") -> dict:

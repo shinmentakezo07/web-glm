@@ -86,3 +86,34 @@ class TestV3ToOpenAI:
         v3 = {"content": [], "finishReason": "stop"}
         result = v3_to_openai(v3, model="my-model")
         assert result["model"] == "my-model"
+
+
+class TestUsageDetails:
+    def test_cached_tokens_mapped(self):
+        usage = _v3_usage_to_openai({
+            "inputTokens": {"total": 100, "cacheRead": 80},
+            "outputTokens": {"total": 10},
+        })
+        assert usage["prompt_tokens"] == 100
+        assert usage["prompt_tokens_details"] == {"cached_tokens": 80}
+
+    def test_reasoning_tokens_mapped(self):
+        usage = _v3_usage_to_openai({
+            "inputTokens": {"total": 5},
+            "outputTokens": {"total": 20, "reasoning": 15},
+        })
+        assert usage["completion_tokens"] == 20
+        assert usage["output_tokens_details"] == {"reasoning_tokens": 15}
+
+    def test_details_omitted_when_absent(self):
+        usage = _v3_usage_to_openai({
+            "inputTokens": {"total": 5},
+            "outputTokens": {"total": 10},
+        })
+        assert usage == {"prompt_tokens": 5, "completion_tokens": 10, "total_tokens": 15}
+        assert "prompt_tokens_details" not in usage
+        assert "output_tokens_details" not in usage
+
+    def test_flat_input_output_tokens(self):
+        usage = _v3_usage_to_openai({"inputTokens": 7, "outputTokens": 3})
+        assert usage == {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
