@@ -78,6 +78,21 @@ GATEWAY_API_KEY = os.getenv("AI_GATEWAY_API_KEY", "")
 GATEWAY_TEAM = os.getenv("GATEWAY_TEAM", "")
 PROXY_API_KEY = os.getenv("PROXY_API_KEY", "")
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "zai/glm-5.2")
+FX_USER_AGENT = os.getenv("FX_USER_AGENT", "fx/0.0.4")
+GATEWAY_SESSION_ID = os.getenv("GATEWAY_SESSION_ID", "")
+GATEWAY_SESSION_AFFINITY = os.getenv("GATEWAY_SESSION_AFFINITY", "")
+
+# Models that receive the body-level headers.user-agent (fx scopes it to
+# zai/glm-5.2). "*" = all models, "" = none, else comma-separated list.
+_raw_pua_models = os.getenv("PRODUCT_USER_AGENT_MODELS", "zai/glm-5.2")
+if _raw_pua_models == "*":
+    PRODUCT_USER_AGENT_MODELS: frozenset[str] | None = None
+elif _raw_pua_models == "":
+    PRODUCT_USER_AGENT_MODELS = frozenset()
+else:
+    PRODUCT_USER_AGENT_MODELS = frozenset(
+        m.strip() for m in _raw_pua_models.split(",") if m.strip()
+    )
 
 GATEWAY_TIMEOUT_CONNECT = float(os.getenv("GATEWAY_TIMEOUT_CONNECT", "15"))
 GATEWAY_TIMEOUT_READ = float(os.getenv("GATEWAY_TIMEOUT_READ", "300"))
@@ -180,11 +195,17 @@ def _get_client() -> httpx.AsyncClient:
 # --------------------------------------------------------------------------- #
 
 
-def _v3_headers(model: str, streaming: bool) -> dict[str, str]:
+def _v3_headers(
+    model: str,
+    streaming: bool,
+    *,
+    session_id: str | None = None,
+    session_affinity: str | None = None,
+) -> dict[str, str]:
     headers: dict[str, str] = {
         "Authorization": f"Bearer {GATEWAY_API_KEY}",
         "Content-Type": "application/json",
-        "User-Agent": "fx/0.0.3",
+        "User-Agent": FX_USER_AGENT,
         "HTTP-Referer": "https://github.com/vercel-labs/fx",
         "X-Title": "fx",
         "ai-gateway-protocol-version": "0.0.1",
@@ -196,6 +217,12 @@ def _v3_headers(model: str, streaming: bool) -> dict[str, str]:
         headers["Accept"] = "text/event-stream"
     if GATEWAY_TEAM:
         headers["x-vercel-ai-gateway-team"] = GATEWAY_TEAM
+    sid = session_id or GATEWAY_SESSION_ID
+    affinity = session_affinity or GATEWAY_SESSION_AFFINITY
+    if sid:
+        headers["x-session-id"] = sid
+    if affinity:
+        headers["x-session-affinity"] = affinity
     return headers
 
 
@@ -390,9 +417,17 @@ async def chat_completions(request: Request, _: str = Depends(verify_proxy_key))
         if isinstance(stream_options, dict) else True
     )
 
-    v3_body = openai_to_v3(body)
+    v3_body = openai_to_v3(
+        body,
+        product_user_agent=FX_USER_AGENT,
+        product_user_agent_models=PRODUCT_USER_AGENT_MODELS,
+    )
     url = urljoin(GATEWAY_BASE_URL + "/", GATEWAY_V3_CHAT.lstrip("/"))
-    headers = _v3_headers(model, streaming=True)
+    session_id = request.headers.get("x-session-id") or GATEWAY_SESSION_ID
+    session_affinity = request.headers.get("x-session-affinity") or GATEWAY_SESSION_AFFINITY
+    headers = _v3_headers(
+        model, streaming=True, session_id=session_id, session_affinity=session_affinity
+    )
 
     if stream:
         resp = await _send_upstream(client, url, headers, v3_body)
@@ -445,9 +480,17 @@ async def responses_route(request: Request, _: str = Depends(verify_proxy_key)):
     chat_body.pop("input", None)
     chat_body.pop("stream", None)
 
-    v3_body = openai_to_v3(chat_body)
+    v3_body = openai_to_v3(
+        chat_body,
+        product_user_agent=FX_USER_AGENT,
+        product_user_agent_models=PRODUCT_USER_AGENT_MODELS,
+    )
     url = urljoin(GATEWAY_BASE_URL + "/", GATEWAY_V3_CHAT.lstrip("/"))
-    headers = _v3_headers(model, streaming=True)
+    session_id = request.headers.get("x-session-id") or GATEWAY_SESSION_ID
+    session_affinity = request.headers.get("x-session-affinity") or GATEWAY_SESSION_AFFINITY
+    headers = _v3_headers(
+        model, streaming=True, session_id=session_id, session_affinity=session_affinity
+    )
 
     if stream:
         resp = await _send_upstream(client, url, headers, v3_body)
