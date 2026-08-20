@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-
 from .parts import (
     _normalize_tool_choice,
     _openai_content_to_v3_parts,

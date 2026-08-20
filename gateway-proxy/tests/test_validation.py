@@ -156,3 +156,28 @@ class TestValidationFixes:
             {"role": "tool", "tool_call_id": "call_1", "name": "calc", "content": "y"},
         ]
         assert validate_tool_history(messages) is None
+
+    def test_stale_result_from_previous_block_rejected(self):
+        # Block 2 must pair its results with its OWN call ids; answering the
+        # previous block's call_1 leaves call_2 unpaired (would otherwise
+        # slip past the global seen_ids check).
+        messages = [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": None, "tool_calls": [self._call("call_1")]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "42"},
+            {"role": "assistant", "content": None, "tool_calls": [self._call("call_2", "step2")]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "stale"},
+        ]
+        err = validate_tool_history(messages)
+        assert err is not None and "unknown tool call" in err
+
+    def test_result_answering_current_block_accepted(self):
+        # Same shape, but the result answers block 2's own call_2: valid.
+        messages = [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": None, "tool_calls": [self._call("call_1")]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "42"},
+            {"role": "assistant", "content": None, "tool_calls": [self._call("call_2", "step2")]},
+            {"role": "tool", "tool_call_id": "call_2", "content": "x"},
+        ]
+        assert validate_tool_history(messages) is None

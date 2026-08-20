@@ -6,6 +6,7 @@ Re-exports the public API so the documented library pattern keeps working:
 """
 
 from .parts import (
+    _image_url_to_v3_part,
     _normalize_tool_choice,
     _openai_content_to_v3_parts,
     _openai_response_format_to_v3,
@@ -32,7 +33,7 @@ from .responses import (
 )
 
 __all__ = [
-    "_normalize_tool_choice", "_openai_content_to_v3_parts",
+    "_image_url_to_v3_part", "_normalize_tool_choice", "_openai_content_to_v3_parts",
     "_openai_response_format_to_v3", "_openai_tool_call_to_v3",
     "_openai_tool_msg_to_v3", "openai_to_v3", "validate_tool_history",
     "_FINISH_REASON_MAP", "_v3_finish_reason", "_v3_usage_to_openai",

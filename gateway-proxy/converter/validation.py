@@ -107,7 +107,7 @@ def validate_tool_history(messages: list[dict]) -> str | None:
         matched_ids: set[str] = set()
         for idx, result in enumerate(results):
             rid = result.get("tool_call_id", "")
-            if rid not in seen_ids:
+            if rid not in call_names:
                 return f"tool result at index {i + 1 + idx} references unknown tool call: {rid}"
             if rid in matched_ids:
                 return f"duplicate tool result for tool call: {rid}"
