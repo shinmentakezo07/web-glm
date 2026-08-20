@@ -111,3 +111,48 @@ class TestValidateToolHistory:
         ]
         err = validate_tool_history(messages)
         assert err is not None and "missing a function name" in err
+
+
+class TestValidationFixes:
+    def _call(self, call_id="call_1", name="calc", args="{}"):
+        return {"id": call_id, "type": "function",
+                "function": {"name": name, "arguments": args}}
+
+    def test_duplicate_key_args_rejected(self):
+        messages = [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                self._call(args='{"a":1,"a":2}'),
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "y"},
+        ]
+        err = validate_tool_history(messages)
+        assert err is not None and "not valid JSON" in err
+
+    def test_nested_duplicate_key_args_rejected(self):
+        messages = [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                self._call(args='{"a":{"b":1,"b":2}}'),
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "y"},
+        ]
+        err = validate_tool_history(messages)
+        assert err is not None and "not valid JSON" in err
+
+    def test_result_name_mismatch_rejected(self):
+        messages = [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": None, "tool_calls": [self._call()]},
+            {"role": "tool", "tool_call_id": "call_1", "name": "wrong_tool", "content": "y"},
+        ]
+        err = validate_tool_history(messages)
+        assert err is not None and "wrong_tool" in err
+
+    def test_result_name_match_accepted(self):
+        messages = [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": None, "tool_calls": [self._call()]},
+            {"role": "tool", "tool_call_id": "call_1", "name": "calc", "content": "y"},
+        ]
+        assert validate_tool_history(messages) is None

@@ -10,6 +10,16 @@ import json
 # --------------------------------------------------------------------------- #
 
 
+def _reject_duplicate_keys(pairs: list[tuple]) -> dict:
+    """object_pairs_hook that raises ValueError on duplicate keys (fx parity)."""
+    seen: set[str] = set()
+    for key, _ in pairs:
+        if key in seen:
+            raise ValueError(f"duplicate key: {key}")
+        seen.add(key)
+    return dict(pairs)
+
+
 def _parse_tool_args(args) -> str | None:
     """Return an error message if tool args are not valid JSON, else None."""
     if isinstance(args, dict):
@@ -18,8 +28,8 @@ def _parse_tool_args(args) -> str | None:
         if not args.strip():
             return "tool call arguments are empty"
         try:
-            json.loads(args)
-        except json.JSONDecodeError:
+            json.loads(args, object_pairs_hook=_reject_duplicate_keys)
+        except ValueError:
             return "tool call arguments are not valid JSON"
         return None
     if args is None:
@@ -79,6 +89,11 @@ def validate_tool_history(messages: list[dict]) -> str | None:
             if err:
                 return err
 
+        call_names: dict[str, str] = {
+            call.get("id", ""): call.get("function", {}).get("name", "")
+            for call in calls
+        }
+
         # The next block must be tool results covering all calls.
         results = []
         j = i + 1
@@ -97,6 +112,11 @@ def validate_tool_history(messages: list[dict]) -> str | None:
             if rid in matched_ids:
                 return f"duplicate tool result for tool call: {rid}"
             matched_ids.add(rid)
+            result_name = result.get("name")
+            expected_name = call_names.get(rid, "")
+            if result_name and expected_name and result_name != expected_name:
+                return (f"tool result for {rid} names tool {result_name!r} "
+                        f"but call {rid} is {expected_name!r}")
             if result.get("content") is None:
                 return f"tool result for {rid} has no content"
 
