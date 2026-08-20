@@ -79,8 +79,9 @@ def responses_input_to_messages(input_items: list | None) -> list[dict]:
                     elif isinstance(part, dict) and part.get("type") in ("text", "output_text", "input_text"):
                         text_parts.append(part.get("text", ""))
                 content = "".join(text_parts)
+            # Preserve system/developer roles; default anything else to user.
             messages.append({
-                "role": ("assistant" if role == "assistant" else "user"),
+                "role": role if role in ("system", "developer", "assistant") else "user",
                 "content": content,
             })
 
@@ -238,13 +239,17 @@ class _ResponsesStreamState:
     def finish(self, finish_reason: str | None, usage: dict | None) -> str:
         """Emit output_text.done / output_item.done for each item + response.completed."""
         out = ""
-        if self.text_parts:
+        full_text = "".join(self.text_parts)
+        # The message item at index 0 is always added by start(); close it even
+        # when there's no text (tool-only response) so it isn't left dangling.
+        if full_text:
             out += self._sse({
                 "type": "response.output_text.done",
                 "item_id": self.msg_id,
                 "output_index": 0,
-                "text": "".join(self.text_parts),
+                "text": full_text,
             })
+        if self.msg_id is not None:
             out += self._sse({
                 "type": "response.output_item.done",
                 "output_index": 0,
@@ -255,7 +260,7 @@ class _ResponsesStreamState:
                     "status": "completed",
                     "content": [{
                         "type": "output_text",
-                        "text": "".join(self.text_parts),
+                        "text": full_text,
                         "annotations": [],
                     }],
                 },
