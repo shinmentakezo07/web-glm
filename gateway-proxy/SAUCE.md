@@ -62,7 +62,7 @@ subprocess.run(['fx', 'ask', '--auto', '--no-save', 'Say hi'], env=env)
 **Headers:**
 ```
 Authorization: Bearer vck_0Y4Aj...
-User-Agent: fx/0.0.3
+User-Agent: fx/0.0.4
 HTTP-Referer: https://github.com/vercel-labs/fx
 X-Title: fx
 ai-gateway-protocol-version: 0.0.1
@@ -70,6 +70,9 @@ ai-language-model-specification-version: 4
 ai-language-model-id: zai/glm-5.2
 ai-language-model-streaming: true
 Content-Type: application/json
+x-vercel-ai-gateway-team: <team-id>     # sent when a Vercel team is set (GATEWAY_TEAM)
+x-session-id: <session-id>              # sent when session pinning is used
+x-session-affinity: <affinity>          # sent when session pinning is used
 ```
 
 **Body:**
@@ -78,7 +81,7 @@ Content-Type: application/json
   "prompt": [...],
   "tools": [...25 tool definitions...],
   "toolChoice": {"type": "auto"},
-  "headers": {"user-agent": "fx/0.0.3"}
+  "headers": {"user-agent": "fx/0.0.4"}
 }
 ```
 
@@ -135,7 +138,7 @@ model output. Then we tested variations to find what's actually required:
 │                                                              │
 │  3. Build fx headers                                         │
 │     _v3_headers()                                            │
-│     • User-Agent: fx/0.0.3                                   │
+│     • User-Agent: fx/0.0.4                                   │
 │     • ai-gateway-protocol-version: 0.0.1                     │
 │     • ai-language-model-specification-version: 4             │
 │     • ai-language-model-id: <model>                         │
@@ -199,7 +202,7 @@ exactly what happens:
   ],
   "tools": [],
   "toolChoice": {"type": "auto"},
-  "headers": {"user-agent": "fx/0.0.3"},
+  "headers": {"user-agent": "fx/0.0.4"},
   "temperature": 0.7,
   "maxOutputTokens": 1000
 }
@@ -213,6 +216,7 @@ This was the hardest bug to find. The v3 protocol has strict rules:
 |---|---|---|
 | `system` | **String** (plain text) | `"You are helpful."` |
 | `user` | **Array** of parts | `[{"type":"text","text":"hi"}]` |
+| `user` (with image) | **Array** of parts | `{"type":"file","mediaType":"image/png","data":"<base64>"}` (data URLs) or `{"type":"image","image":"<url>"}` (remote URLs) |
 | `assistant` | **Array** of parts | `[{"type":"text","text":"hello"}]` |
 | `tool` | **Array** of parts | `[{"type":"text","text":"result"}]` |
 
@@ -238,7 +242,7 @@ v3_body = {
     "prompt": prompt,
     "tools": [],                    # required — without this, 503
     "toolChoice": {"type": "auto"}, # required — without this, 503
-    "headers": {"user-agent": "fx/0.0.3"},
+    "headers": {"user-agent": "fx/0.0.4"},
 }
 ```
 
@@ -308,6 +312,21 @@ data: [DONE]
 | `finish` | Final chunk with `finish_reason` + `usage` | End of response |
 | `error` | Final chunk with `finish_reason: stop` | Error handling |
 
+### Newer stream events (fx-aligned)
+
+The fx CLI emits additional v3 event types. The proxy's stream handler
+treats them as follows:
+
+| v3 event type | Proxy handling |
+|---|---|
+| `reasoning-start` / `reasoning-end` | no-op |
+| `reasoning-delta` | chunk with `delta.reasoning_content` |
+| `start` / `start-step` | no-op |
+| `finish-step` | remembers step usage; used if `finish` has none |
+| `tool-result` / `source` / `file` / `raw` | no-op |
+| `response-metadata` | captures `modelId` for the response model |
+| unknown | ignored |
+
 ### Finish reason mapping
 
 | v3 `finishReason.unified` | OpenAI `finish_reason` |
@@ -325,9 +344,12 @@ v3 usage format:
  "outputTokens": {"total": 6, "text": 6, "reasoning": 0}}
 ```
 
-OpenAI usage format:
+OpenAI usage format (`cacheRead` → `prompt_tokens_details.cached_tokens`,
+`reasoning` → `output_tokens_details.reasoning_tokens`):
 ```json
-{"prompt_tokens": 19, "completion_tokens": 6, "total_tokens": 25}
+{"prompt_tokens": 19, "prompt_tokens_details": {"cached_tokens": 10560},
+  "completion_tokens": 6, "output_tokens_details": {"reasoning_tokens": 0},
+  "total_tokens": 25}
 ```
 
 ---
@@ -371,26 +393,64 @@ gateway-proxy/
 ├── README.md          # User-facing docs
 ├── SAUCE.md           # This file — how it all works
 ├── main.py            # Entry point → delegates to server.app
-├── server.py          # Main proxy implementation
+├── server.py          # Main proxy implementation (HTTP transport + routes)
+├── converter/         # OpenAI ↔ v3 translation package (see package map below)
+├── tests/             # pytest suite (converter + server behavior)
 ├── pyproject.toml     # Dependencies: fastapi, httpx[http2], uvicorn
-├── test_proxy.py      # Smoke tests
+├── test_proxy.py      # Live-server smoke tests (not pytest)
 └── uv.lock            # Locked dependency versions
 ```
 
 ---
 
+## 🗺 converter/ package map
+
+The OpenAI ↔ v3 translation layer is a pure-Python package (no I/O):
+
+```
+converter/
+├── parts.py       # content parts (text/image/tool-call/tool-result), response_format, tool_choice
+├── request.py     # openai_to_v3 + body user-agent scoping + reasoning normalization
+├── validation.py  # validate_tool_history (duplicate-key JSON, result-name match)
+├── response.py    # v3_to_openai + finish-reason + usage mapping (cached/reasoning tokens)
+├── streaming.py   # stream state, event dispatch, v3_stream_iter / v3_stream_to_openai
+├── responses.py   # Responses API translation
+└── __main__.py    # CLI: python -m converter
+```
+
+`server.py` imports `openai_to_v3`, `validate_tool_history`, `v3_stream_iter`,
+`v3_sse_stream_to_openai`, and the Responses helpers from it; everything in
+`converter/` is unit-tested in `tests/` and has no network dependency.
+
+---
+
 ## 🧩 server.py — function-by-function breakdown
 
-### Configuration (lines 54-72)
+Note: the request/response translation used to live in `server.py` as
+`_openai_to_v3()` / `_sse_chunk()` / `_v3_stream_to_openai()` /
+`_v3_response_to_openai()`. It now lives in the `converter/` package —
+`converter/request.py::openai_to_v3`, `converter/streaming.py::v3_stream_iter`
+(streaming) / `v3_sse_stream_to_openai` (non-streaming), and
+`converter/response.py::v3_to_openai`. `server.py` imports these and keeps
+only the HTTP transport. Line references below are for the current
+`server.py`.
+
+### Configuration (lines 76-104)
 
 Reads environment variables at import time:
 - `GATEWAY_BASE_URL` — Gateway URL (default: `https://ai-gateway.vercel.sh`)
 - `AI_GATEWAY_API_KEY` — Your Gateway API key (required)
-- `GATEWAY_TEAM` — Optional Vercel team slug
+- `GATEWAY_TEAM` — Optional Vercel team slug (sets `x-vercel-ai-gateway-team`)
 - `PROXY_API_KEY` — Key your clients must send (optional, empty = open)
 - `DEFAULT_MODEL` — Fallback model (default: `zai/glm-5.2`)
+- `FX_USER_AGENT` — Upstream `User-Agent` header (default: `fx/0.0.4`)
+- `PRODUCT_USER_AGENT_MODELS` — Models that get the body-level
+  `headers.user-agent` (`*` = all, empty = none, else comma-separated;
+  default: `zai/glm-5.2`)
+- `GATEWAY_SESSION_ID` / `GATEWAY_SESSION_AFFINITY` — Optional session
+  pinning header values (also forwarded from inbound requests)
 
-### `lifespan()` — async context manager (lines 80-94)
+### `lifespan()` — async context manager (lines 130-150)
 
 Creates a shared `httpx.AsyncClient` with:
 - HTTP/2 enabled (the Gateway requires HTTP/2)
@@ -398,27 +458,32 @@ Creates a shared `httpx.AsyncClient` with:
 - Long timeouts (300s read for slow model responses)
 - Closes the client on shutdown
 
-### `verify_proxy_key()` — auth dependency (lines 105-115)
+### `verify_proxy_key()` — auth dependency (lines 174-183)
 
 FastAPI security dependency. Checks the incoming Bearer token against
 `PROXY_API_KEY`. Returns `"anonymous"` if open mode, raises 401 otherwise.
 
-### `_v3_headers()` — build fx headers (lines 123-140)
+### `_v3_headers()` — build fx headers (lines 198-227)
 
-Constructs the exact header set the fx CLI sends. These headers are what
-makes the Gateway treat the request as a "fx CLI" request:
+Constructs the exact header set the fx CLI sends. The `User-Agent` comes from
+`FX_USER_AGENT` (default `fx/0.0.4`); `x-vercel-ai-gateway-team` is sent when
+`GATEWAY_TEAM` is set, and `x-session-id` / `x-session-affinity` are sent when
+session pinning is used (`GATEWAY_SESSION_ID` / `GATEWAY_SESSION_AFFINITY`,
+or forwarded from the client's `x-session-id` / `x-session-affinity`):
 
 ```
-User-Agent: fx/0.0.3
+User-Agent: fx/0.0.4
 HTTP-Referer: https://github.com/vercel-labs/fx
 X-Title: fx
 ai-gateway-protocol-version: 0.0.1
 ai-language-model-specification-version: 4
 ai-language-model-id: <model>
 ai-language-model-streaming: true
+x-session-id: <value>        # when session pinning is used
+x-session-affinity: <value>  # when session pinning is used
 ```
 
-### `_openai_to_v3()` — request translator (lines 148-237)
+### `openai_to_v3()` — request translator (converter/request.py)
 
 Converts OpenAI request body to AI SDK v3 format:
 
@@ -427,16 +492,23 @@ Converts OpenAI request body to AI SDK v3 format:
    - `system` → content becomes a plain **string**
    - `user`/`assistant`/`tool` → content becomes an **array of parts**
 3. Handles string content, array content (OpenAI vision format), and
-   converts image_url parts to v3 image parts
-4. Injects `tools: []` and `toolChoice: {type: auto}` (required)
-5. Passes through optional parameters:
+   converts `image_url` parts to v3 parts (data URLs become
+   `{"type":"file","mediaType":...,"data":...}`, remote URLs keep
+   `{"type":"image","image":...}`)
+4. Injects `tools` and `toolChoice` (required)
+5. Adds the body-level `headers.user-agent` only for the models in
+   `PRODUCT_USER_AGENT_MODELS` (fx scopes it to `zai/glm-5.2`)
+6. Passes through optional parameters:
    - `temperature` → `temperature`
    - `max_tokens` → `maxOutputTokens`
    - `top_p` → `topP`
    - `stop` → `stopSequences`
-6. Translates OpenAI tool definitions to v3 format if provided
+   - `response_format` → `responseFormat`
+   - `reasoning` / `reasoning_effort` → `reasoning` (normalized to the
+     string label fx uses)
+7. Translates OpenAI tool definitions to v3 format if provided
 
-### `_sse_chunk()` — OpenAI chunk builder (lines 245-268)
+### `_sse_chunk()` — OpenAI chunk builder (converter/streaming.py)
 
 Helper that builds a single OpenAI-format SSE chunk:
 
@@ -451,66 +523,79 @@ Helper that builds a single OpenAI-format SSE chunk:
 }
 ```
 
-### `_v3_stream_to_openai()` — SSE translator (lines 271-375)
+### `v3_stream_iter()` / `v3_sse_stream_to_openai()` — SSE translator (converter/streaming.py)
 
-Async generator that reads v3 SSE events from the Gateway and yields
-OpenAI-format SSE chunks:
+`v3_stream_iter` is the async generator that reads v3 SSE events from the
+Gateway and yields OpenAI-format SSE chunks live:
 
 1. Yields initial chunk with `role: assistant`
 2. For each v3 event:
    - `text-delta` → yields chunk with content delta
+   - `reasoning-delta` → yields chunk with `delta.reasoning_content`
    - `tool-call` → yields chunk with tool_calls
+   - `finish-step` → remembers step usage (used if `finish` has none)
    - `finish` → yields final chunk with finish_reason + usage, then breaks
    - `error` → yields final chunk, then breaks
-3. Yields ` sentinel
+3. Yields `data: [DONE]` sentinel
 
-### `_v3_response_to_openai()` — non-stream converter (lines 383-421)
+`v3_sse_stream_to_openai` is the non-streaming helper: it consumes the same
+event stream and returns a single OpenAI `chat.completion` dict.
 
-Converts a v3 non-streaming response to OpenAI format (used for the
-embeddings-style single response). In practice, the proxy always streams
-from upstream, so this function is available but the main chat endpoint
-collects deltas manually for non-streaming clients.
+### `_collect_response()` — non-stream converter (lines 344-360)
 
-### `_client_error()` — error forwarder (lines 424-430)
+Consumes the always-streaming upstream connection, parses the SSE lines into
+events, and feeds them to `v3_sse_stream_to_openai` so non-streaming clients
+get a single JSON response.
+
+### `_client_error()` — error forwarder (lines 255-271)
 
 Wraps upstream error responses and forwards them as JSON with the original
 status code.
 
 ### Routes
 
-#### `GET /healthz` (line 438)
+#### `GET /healthz` (line 363)
 
 Returns health status. No auth required. Useful for load balancers.
 
-#### `GET /v1/models` (line 443)
+#### `GET /v1/models` (line 368)
 
 Proxies to the Gateway's public `/v1/models` endpoint. Returns the full
 list of available models (349+ models including 17 GLM variants).
 
-#### `POST /v1/chat/completions` (line 456)
+#### `POST /v1/chat/completions` (line 392)
 
 The main endpoint. Handles both streaming and non-streaming:
 
 **Streaming mode** (`stream: true`):
-1. Translate OpenAI request → v3 format
-2. Open streaming connection to Gateway
-3. Pipe through `_v3_stream_to_openai()` translator
-4. Return as `StreamingResponse` with `text/event-stream`
+1. Translate OpenAI request → v3 format (`converter.openai_to_v3`)
+2. Build fx headers (`_v3_headers`, including session headers)
+3. Open streaming connection to Gateway
+4. Pipe through the stream translator (`_chat_stream` → `v3_stream_iter`)
+5. Return as `StreamingResponse` with `text/event-stream`
 
 **Non-streaming mode** (`stream: false`):
 1. Translate OpenAI request → v3 format
 2. Open streaming connection to Gateway (always streams upstream!)
-3. Collect all `text-delta` events into a list
+3. Collect all deltas via `_collect_response` → `v3_sse_stream_to_openai`
 4. Capture `finish` event for finish_reason + usage
-5. Assemble a single OpenAI JSON response
-6. Return as `JSONResponse`
+5. Assembly happens in the converter (streaming.py)
+6. Return the assembled OpenAI JSON as `JSONResponse`
 
-#### `POST /v1/embeddings` (line 561)
+#### `POST /v1/responses` (line 457)
+
+Proxies the OpenAI Responses API (`input` items) via the v3 endpoint.
+Translates Responses `input` to chat messages
+(`converter/responses.py::responses_input_to_messages`), streams through
+`v3_stream_iter`, and re-emits Responses-format SSE
+(`openai_chunk_to_responses_sse`).
+
+#### `POST /v1/embeddings` (line 520)
 
 Proxies to the Gateway's `/v1/embeddings` endpoint. Uses the standard
 v1 protocol (embeddings don't have the credit card restriction).
 
-### `main()` — entrypoint (lines 589-601)
+### `main()` — entrypoint (lines 544-555)
 
 Starts uvicorn with the FastAPI app. Reads `HOST`, `PORT`, `RELOAD`,
 and `LOG_LEVEL` from environment.
@@ -571,7 +656,11 @@ The "5.2" models are the newest and are offered as a free tier.
 | `PROXY_API_KEY` | No | (empty) | Key your clients must send. Empty = open |
 | `DEFAULT_MODEL` | No | `zai/glm-5.2` | Fallback when client doesn't specify a model |
 | `GATEWAY_BASE_URL` | No | `https://ai-gateway.vercel.sh` | Gateway URL |
-| `GATEWAY_TEAM` | No | (empty) | Optional Vercel team slug |
+| `GATEWAY_TEAM` | No | (empty) | Optional Vercel team slug (sets `x-vercel-ai-gateway-team`) |
+| `FX_USER_AGENT` | No | `fx/0.0.4` | Upstream `User-Agent` header (mirrors current fx CLI) |
+| `PRODUCT_USER_AGENT_MODELS` | No | `zai/glm-5.2` | Models that get the body-level `headers.user-agent` (`*` = all, empty = none, else comma-separated) |
+| `GATEWAY_SESSION_ID` | No | (empty) | Session id sent as `x-session-id` (session pinning) |
+| `GATEWAY_SESSION_AFFINITY` | No | (empty) | Session affinity sent as `x-session-affinity` (session pinning) |
 | `HOST` | No | `0.0.0.0` | Server bind address |
 | `PORT` | No | `8787` | Server port |
 | `LOG_LEVEL` | No | `INFO` | Logging level |
@@ -688,8 +777,15 @@ curl http://localhost:8787/v1/models \
    temporarily. This is a provider-side issue (runware/blackbox backends).
    Retrying usually works.
 
-8. **API key in `~/.fx/api-key`** — If you have the fx CLI installed, the
-   key is already there. The proxy reads it from the `.env` file.
+8. **Where the API key lives** — The key location is documented in the
+   comment above `AI_GATEWAY_API_KEY` in `.env.example` (if you have the fx
+   CLI installed, the key is already at `~/.fx/api-key`). The proxy reads
+   the key from the `.env` file.
+
+9. **Session headers are forwarded** — If the client sends `x-session-id` /
+   `x-session-affinity`, they are forwarded upstream (falling back to
+   `GATEWAY_SESSION_ID` / `GATEWAY_SESSION_AFFINITY` when the client
+   doesn't send them).
 
 ---
 
@@ -716,7 +812,7 @@ Client sends:
   │
   ▼
 [_v3_headers]  ← build fx headers
-  │               • User-Agent: fx/0.0.3
+  │               • User-Agent: fx/0.0.4
   │               • ai-gateway-protocol-version: 0.0.1
   │               • ai-language-model-streaming: true
   │

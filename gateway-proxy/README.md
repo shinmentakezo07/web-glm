@@ -25,7 +25,7 @@ Your CLI (OpenAI format)
 Proxy (FastAPI on :8787)
     ├─ translates OpenAI → AI SDK v3 format
     ├─ adds fx headers:
-    │    User-Agent: fx/0.0.3
+    │    User-Agent: fx/0.0.4
     │    ai-gateway-protocol-version: 0.0.1
     │    ai-language-model-specification-version: 4
     │    HTTP-Referer: https://github.com/vercel-labs/fx
@@ -123,13 +123,15 @@ curl http://localhost:8787/v1/models \
 
 ```
 Authorization: Bearer <gateway_key>
-User-Agent: fx/0.0.3
+User-Agent: fx/0.0.4
 HTTP-Referer: https://github.com/vercel-labs/fx
 X-Title: fx
 ai-gateway-protocol-version: 0.0.1
 ai-language-model-specification-version: 4
 ai-language-model-id: <model>
 ai-language-model-streaming: true
+x-session-id: <sid>            # only sent when configured (session pinning)
+x-session-affinity: <affinity> # only sent when configured (session pinning)
 ```
 
 ## Notes
@@ -139,4 +141,6 @@ ai-language-model-streaming: true
   endpoint only works in streaming mode for free-tier models.
 - The body must include `"tools": []` and `"toolChoice": {"type": "auto"}` — without
   these, the Gateway returns 503 for free-tier models. The proxy adds them automatically.
+- The body-level `headers.user-agent` is only sent for `zai/glm-5.2` (mirrors the fx
+  CLI); override with `PRODUCT_USER_AGENT_MODELS` (`*` = all models, empty = none).
 - `zai/glm-5.2` is confirmed to work without a credit card. Other models may require one.

@@ -9,7 +9,7 @@ the **same v3 AI SDK protocol** the native fx CLI uses:
 
     Headers:
       Authorization: Bearer <gateway_key>
-      User-Agent: fx/0.0.3
+      User-Agent: fx/0.0.4
       HTTP-Referer: https://github.com/vercel-labs/fx
       X-Title: fx
       ai-gateway-protocol-version: 0.0.1
