@@ -168,7 +168,7 @@ class TestOpenAIToV3:
 
     def test_reasoning_passthrough(self):
         body = {"messages": [{"role": "user", "content": "x"}], "reasoning": {"effort": "high"}}
-        assert openai_to_v3(body)["reasoning"] == {"effort": "high"}
+        assert openai_to_v3(body)["reasoning"] == "high"
 
     def test_reasoning_effort_mapping(self):
         body = {"messages": [{"role": "user", "content": "x"}], "reasoning_effort": "minimal"}
@@ -189,3 +189,57 @@ class TestOpenAIToV3:
         snapshot = copy.deepcopy(body)
         openai_to_v3(body)
         assert body == snapshot
+
+
+# =====================================================================
+# Body user-agent scoping (fx only sends it for zai/glm-5.2)
+# =====================================================================
+
+
+class TestBodyUserAgentScoping:
+    def test_glm52_includes_user_agent(self):
+        body = {"model": "zai/glm-5.2", "messages": [{"role": "user", "content": "x"}]}
+        assert openai_to_v3(body)["headers"] == {"user-agent": "fx/0.0.4"}
+
+    def test_other_model_omits_user_agent(self):
+        body = {"model": "anthropic/claude", "messages": [{"role": "user", "content": "x"}]}
+        assert "headers" not in openai_to_v3(body)
+
+    def test_override_model_set(self):
+        body = {"model": "anthropic/claude", "messages": [{"role": "user", "content": "x"}]}
+        result = openai_to_v3(body, product_user_agent_models=frozenset({"anthropic/claude"}))
+        assert result["headers"] == {"user-agent": "fx/0.0.4"}
+
+    def test_all_models_when_none(self):
+        body = {"model": "anthropic/claude", "messages": [{"role": "user", "content": "x"}]}
+        result = openai_to_v3(body, product_user_agent_models=None)
+        assert result["headers"] == {"user-agent": "fx/0.0.4"}
+
+    def test_no_models_when_empty(self):
+        body = {"model": "zai/glm-5.2", "messages": [{"role": "user", "content": "x"}]}
+        result = openai_to_v3(body, product_user_agent_models=frozenset())
+        assert "headers" not in result
+
+    def test_custom_user_agent(self):
+        body = {"model": "zai/glm-5.2", "messages": [{"role": "user", "content": "x"}]}
+        result = openai_to_v3(body, product_user_agent="fx/0.0.9")
+        assert result["headers"] == {"user-agent": "fx/0.0.9"}
+
+
+# =====================================================================
+# Reasoning normalization (v3 uses a string label)
+# =====================================================================
+
+
+class TestReasoningNormalization:
+    def test_reasoning_string_passthrough(self):
+        body = {"messages": [{"role": "user", "content": "x"}], "reasoning": "high"}
+        assert openai_to_v3(body)["reasoning"] == "high"
+
+    def test_reasoning_effort_dict_normalized_to_string(self):
+        body = {"messages": [{"role": "user", "content": "x"}], "reasoning": {"effort": "high"}}
+        assert openai_to_v3(body)["reasoning"] == "high"
+
+    def test_reasoning_effort_param_unchanged(self):
+        body = {"messages": [{"role": "user", "content": "x"}], "reasoning_effort": "minimal"}
+        assert openai_to_v3(body)["reasoning"] == "minimal"

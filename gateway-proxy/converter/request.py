@@ -18,7 +18,12 @@ from .parts import (
 # --------------------------------------------------------------------------- #
 
 
-def openai_to_v3(body: dict) -> dict:
+def openai_to_v3(
+    body: dict,
+    *,
+    product_user_agent: str = "fx/0.0.4",
+    product_user_agent_models: frozenset[str] | None = frozenset({"zai/glm-5.2"}),
+) -> dict:
     """Convert an OpenAI chat-completions request to AI SDK v3 format.
 
     Translates:
@@ -27,8 +32,13 @@ def openai_to_v3(body: dict) -> dict:
     - temperature, max_tokens, top_p, stop, response_format, reasoning,
       providerOptions parameters
 
+    `product_user_agent` / `product_user_agent_models` control the body-level
+    `headers.user-agent` (fx only sends it for zai/glm-5.2). Pass
+    `product_user_agent_models=None` for all models, `frozenset()` for none.
+
     Does NOT modify the input body.
     """
+    model = body.get("model", "")
     messages = body.get("messages", [])
 
     # Back-fill toolName on tool results from the preceding assistant message.
@@ -98,8 +108,9 @@ def openai_to_v3(body: dict) -> dict:
         "prompt": prompt,
         "tools": v3_tools,
         "toolChoice": _normalize_tool_choice(body.get("tool_choice", {"type": "auto"})),
-        "headers": {"user-agent": "fx-converter"},
     }
+    if product_user_agent_models is None or model in product_user_agent_models:
+        v3_body["headers"] = {"user-agent": product_user_agent}
 
     if "temperature" in body:
         v3_body["temperature"] = body["temperature"]
@@ -117,14 +128,15 @@ def openai_to_v3(body: dict) -> dict:
     if rf:
         v3_body["responseFormat"] = rf
 
-    # Reasoning effort (OpenAI) / reasoning (v3, fx).
+    # Reasoning effort (OpenAI) / reasoning (v3, fx uses a string label).
     if "reasoning" in body:
-        v3_body["reasoning"] = body["reasoning"]
+        _reasoning = body["reasoning"]
+        if isinstance(_reasoning, dict) and isinstance(_reasoning.get("effort"), str):
+            v3_body["reasoning"] = _reasoning["effort"]
+        else:
+            v3_body["reasoning"] = _reasoning
     elif "reasoning_effort" in body:
-        _effort_map = {"low": "low", "medium": "medium", "high": "high", "minimal": "minimal"}
-        v3_body["reasoning"] = _effort_map.get(
-            body.get("reasoning_effort"), body.get("reasoning_effort")
-        )
+        v3_body["reasoning"] = body["reasoning_effort"]
 
     # Provider options passthrough (routing, caching, BYOK, fallbacks...).
     if isinstance(body.get("providerOptions"), dict) and body["providerOptions"]:
