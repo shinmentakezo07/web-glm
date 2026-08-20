@@ -3,8 +3,17 @@ Standalone OpenAI <-> AI SDK v3 format converter.
 
 Translates between the OpenAI chat-completions format (what most CLIs and
 agents speak) and the AI SDK v3 format (what the Vercel AI Gateway expects).
-This is the same protocol the fx CLI uses internally
-(see fx/src/core/gateway/gateway_json.zig).
+
+Canonical wire format for tool calls — matches what server.py sends to the
+real gateway:
+
+  * tool calls are a **top-level `toolCalls` array** on assistant messages
+    (NOT content parts with `"type": "tool-call"`).
+  * the `input` field on a tool call is a **stringified JSON string**.
+
+Tool-result messages (role: "tool") carry a `toolName` that is back-filled
+from the preceding assistant message so the gateway always sees a valid
+name, even though OpenAI itself omits it.
 
 Use it as a library so agents can talk to each other through the gateway
 without an HTTP proxy layer:
@@ -15,7 +24,7 @@ without an HTTP proxy layer:
     # ...send v3_body to gateway, get v3_response...
     openai_response = v3_to_openai(v3_response_dict)
 
-The functions are pure: no network calls, no side effects.
+The conversion functions are pure: no network calls, no side effects.
 """
 
 from __future__ import annotations
@@ -23,6 +32,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from collections.abc import Iterator
 
 
 # --------------------------------------------------------------------------- #
@@ -63,30 +73,29 @@ def _openai_content_to_v3_parts(content) -> list[dict]:
 
 
 def _openai_tool_call_to_v3(tool_call: dict) -> dict:
-    """Convert an OpenAI tool call to a v3 tool-call content part.
+    """Convert an OpenAI tool call to a v3 top-level toolCalls entry.
 
-    v3 tool-call parts go inside the assistant's content array. The `input`
-    field is a raw JSON object (not stringified).
+    v3 toolCalls are a top-level array on assistant messages. The `input`
+    field is a **stringified JSON string** (matching the server's wire format).
 
     OpenAI input:
         {"id": "call_1", "type": "function",
          "function": {"name": "read_file", "arguments": "{\"path\":\"...\"}"}}
 
     v3 output:
-        {"type": "tool-call", "toolCallId": "call_1",
-         "toolName": "read_file", "input": {"path": "..."}}
+        {"toolCallId": "call_1", "toolName": "read_file",
+         "input": "{\"path\": \"...\"}"}
     """
     fn = tool_call.get("function", {}) if tool_call.get("type") == "function" else {}
     args = fn.get("arguments", "{}")
-    if isinstance(args, str):
+    if args is None:
+        args = "{}"
+    elif not isinstance(args, str):
         try:
-            args = json.loads(args)
-        except (json.JSONDecodeError, TypeError):
-            args = {}
-    elif args is None:
-        args = {}
+            args = json.dumps(args)
+        except (TypeError, ValueError):
+            args = "{}"
     return {
-        "type": "tool-call",
         "toolCallId": tool_call.get("id", ""),
         "toolName": fn.get("name", ""),
         "input": args,
@@ -103,12 +112,14 @@ def _openai_tool_msg_to_v3(msg: dict) -> dict:
         {"role": "tool", "content": [{"type": "tool-result",
             "toolCallId": "call_1", "toolName": "...",
             "output": {"type": "text", "value": "result text"}}]}
+
+    The `toolName` is left blank here; the caller is expected to back-fill it
+    from the preceding assistant message (see `openai_to_v3`).
     """
     tool_call_id = msg.get("tool_call_id", "")
     tool_name = msg.get("name", "")
     content = msg.get("content")
 
-    # Extract tool name from content parts if present.
     if isinstance(content, list):
         for part in content:
             if isinstance(part, dict) and part.get("name") and not tool_name:
@@ -140,13 +151,40 @@ def _openai_tool_msg_to_v3(msg: dict) -> dict:
     }
 
 
+def _normalize_tool_choice(tool_choice) -> dict:
+    """Normalize an OpenAI tool_choice to the v3 object shape.
+
+    OpenAI clients send tool_choice as a plain string ("auto" / "none" /
+    "required") or as {"type": "function", "function": {"name": "..."}}.
+    The v3 gateway only accepts object shapes:
+        {"type": "auto"} | {"type": "none"} | {"type": "required"}
+        | {"type": "tool", "toolName": "..."}
+    """
+    if isinstance(tool_choice, dict):
+        if tool_choice.get("type") == "function":
+            fn = tool_choice.get("function", {})
+            return {"type": "tool", "toolName": fn.get("name", "")}
+        # Already a v3 object shape — pass through untouched.
+        return tool_choice
+    if isinstance(tool_choice, str):
+        return {
+            "auto": {"type": "auto"},
+            "none": {"type": "none"},
+            "required": {"type": "required"},
+        }.get(tool_choice, {"type": "auto"})
+    return {"type": "auto"}
+
+
 def openai_to_v3(body: dict) -> dict:
     """Convert an OpenAI chat-completions request to AI SDK v3 format.
 
     Translates:
     - messages: role/content format conversion
-    - tools: OpenAI {"type":"function","function":{...}} -> v3 flat {"type":"function","name","description","parameters"}
+    - tools: OpenAI {"type":"function","function":{...}} -> v3 flat {"type":"function","name","description","inputSchema"}
     - temperature, max_tokens, top_p, stop parameters
+
+    The `toolName` field on tool-result messages is back-filled from the
+    preceding assistant message so the gateway always sees a valid name.
 
     Does NOT modify the input body.
     """
@@ -168,7 +206,6 @@ def openai_to_v3(body: dict) -> dict:
     for msg in messages:
         role = msg.get("role", "user")
 
-        # System: content as plain string.
         if role == "system":
             content = msg.get("content") or ""
             if isinstance(content, list):
@@ -182,7 +219,6 @@ def openai_to_v3(body: dict) -> dict:
             prompt.append({"role": "system", "content": str(content)})
             continue
 
-        # Tool: v3 tool-result part.
         if role == "tool":
             v3_tool_msg = _openai_tool_msg_to_v3(msg)
             if not v3_tool_msg["content"][0].get("toolName"):
@@ -191,13 +227,12 @@ def openai_to_v3(body: dict) -> dict:
             prompt.append(v3_tool_msg)
             continue
 
-        # User / assistant.
         if role == "assistant" and msg.get("tool_calls"):
-            content_parts = _openai_content_to_v3_parts(msg.get("content"))
-            tool_call_parts = [_openai_tool_call_to_v3(tc) for tc in msg["tool_calls"]]
+            tool_calls = [_openai_tool_call_to_v3(tc) for tc in msg["tool_calls"]]
             prompt.append({
                 "role": "assistant",
-                "content": content_parts + tool_call_parts,
+                "content": _openai_content_to_v3_parts(msg.get("content")),
+                "toolCalls": tool_calls,
             })
         else:
             prompt.append({
@@ -210,23 +245,19 @@ def openai_to_v3(body: dict) -> dict:
     openai_tools = body.get("tools")
     if openai_tools:
         for t in openai_tools:
-            if isinstance(t, dict):
-                if "function" in t:
-                    fn = t["function"]
-                    v3_tools.append({
-                        "type": t.get("type", "function"),
-                        "name": fn.get("name", ""),
-                        "description": fn.get("description", ""),
-                        "parameters": fn.get("parameters", {}),
-                    })
-                elif "name" in t:
-                    # Already flat v3 shape — pass through.
-                    v3_tools.append(t)
+            if isinstance(t, dict) and "function" in t:
+                fn = t["function"]
+                v3_tools.append({
+                    "type": "function",
+                    "name": fn.get("name", ""),
+                    "description": fn.get("description", ""),
+                    "inputSchema": fn.get("parameters", {}),
+                })
 
     v3_body: dict = {
         "prompt": prompt,
         "tools": v3_tools,
-        "toolChoice": body.get("tool_choice", {"type": "auto"}),
+        "toolChoice": _normalize_tool_choice(body.get("tool_choice", {"type": "auto"})),
         "headers": {"user-agent": "fx-converter"},
     }
 
@@ -249,8 +280,8 @@ def openai_to_v3(body: dict) -> dict:
 # --------------------------------------------------------------------------- #
 
 
-# Mapping of v3 finish reasons to OpenAI finish reasons.
-_FINISH_REASON_MAP = {
+# Mapping of v3 finish reasons (both snake_case and camelCase) to OpenAI reasons.
+_FINISH_REASON_MAP: dict[str, str] = {
     "stop": "stop",
     "length": "length",
     "tool-calls": "tool_calls",
@@ -288,8 +319,6 @@ def v3_to_openai(v3_data: dict, model: str = "") -> dict:
     """
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
-    # v3 responses can come as a flat {"content":[...],"finishReason":...}
-    # or wrapped in choices[0].
     if "choices" in v3_data:
         choice = v3_data["choices"][0] if v3_data["choices"] else {}
         msg = choice.get("message", {})
@@ -300,17 +329,17 @@ def v3_to_openai(v3_data: dict, model: str = "") -> dict:
         finish_raw = v3_data.get("finishReason", "stop")
         usage_data = v3_data.get("usage", {})
 
-    content_parts = msg.get("content", [])
     text = ""
     tool_calls: list[dict] = []
 
-    for part in content_parts:
+    # Collect text + tool-call content parts.
+    for part in msg.get("content", []):
         if not isinstance(part, dict):
             continue
         if part.get("type") == "text":
             text += part.get("text", "")
         elif part.get("type") == "tool-call":
-            tool_args = part.get("input", {})
+            tool_args = part.get("input", "{}")
             if not isinstance(tool_args, str):
                 try:
                     tool_args = json.dumps(tool_args)
@@ -324,6 +353,23 @@ def v3_to_openai(v3_data: dict, model: str = "") -> dict:
                     "arguments": tool_args,
                 },
             })
+
+    # Also accept top-level toolCalls (the wire format sent to the gateway).
+    for idx, tc in enumerate(msg.get("toolCalls", [])):
+        tool_args = tc.get("input", "{}")
+        if not isinstance(tool_args, str):
+            try:
+                tool_args = json.dumps(tool_args)
+            except (TypeError, ValueError):
+                tool_args = "{}"
+        tool_calls.append({
+            "id": tc.get("toolCallId", ""),
+            "type": "function",
+            "function": {
+                "name": tc.get("toolName", ""),
+                "arguments": tool_args,
+            },
+        })
 
     # Some v3 responses also carry top-level tool_calls (OpenAI-style).
     for tc in msg.get("tool_calls", []):
@@ -396,6 +442,11 @@ def v3_stream_to_openai(
     tool_input_buffers: dict[str, str] = {}
     finish_reason = "stop"
 
+    # Per-tool-call index counter so multiple tool calls in one turn get
+    # sequential indices (0, 1, 2, ...) as OpenAI expects.
+    tool_call_index: dict[str, int] = {}
+    next_tool_index = 0
+
     for event in events:
         etype = event.get("type", "")
 
@@ -419,6 +470,13 @@ def v3_stream_to_openai(
                 except (TypeError, ValueError):
                     tool_args = ""
             tool_args = tool_args or tool_input_buffers.get(tool_id, "")
+
+            idx = tool_call_index.get(tool_id)
+            if idx is None:
+                idx = next_tool_index
+                tool_call_index[tool_id] = idx
+                next_tool_index += 1
+
             chunk = {
                 "id": chat_id,
                 "object": "chat.completion.chunk",
@@ -428,7 +486,7 @@ def v3_stream_to_openai(
                     "index": 0,
                     "delta": {
                         "tool_calls": [{
-                            "index": 0,
+                            "index": idx,
                             "id": tool_id,
                             "type": "function",
                             "function": {"name": tool_name, "arguments": tool_args},
@@ -456,6 +514,160 @@ def v3_stream_to_openai(
 
 
 # --------------------------------------------------------------------------- #
+# Streaming iterator (used by server.py for live HTTP)
+# --------------------------------------------------------------------------- #
+
+
+def v3_stream_iter(
+    events: Iterator[dict],
+    model: str = "",
+) -> Iterator[str]:
+    """Iterate over v3 SSE events (one at a time) and yield OpenAI SSE chunks.
+
+    Used by the proxy server to translate a live upstream SSE stream
+    incrementally rather than buffering the whole response.
+    """
+    chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    yield _sse_chunk(chat_id, model, role="assistant")
+
+    tool_input_buffers: dict[str, str] = {}
+    tool_call_index: dict[str, int] = {}
+    next_tool_index = 0
+    finished = False
+
+    for event in events:
+        etype = event.get("type", "")
+
+        if etype == "text-delta":
+            delta = event.get("delta", "")
+            if delta:
+                yield _sse_chunk(chat_id, model, delta_text=delta)
+
+        elif etype == "tool-input-delta":
+            tool_id = event.get("toolCallId", "") or event.get("id", "")
+            if tool_id:
+                tool_input_buffers[tool_id] = tool_input_buffers.get(tool_id, "") + event.get("delta", "")
+
+        elif etype == "tool-call":
+            tool_id = event.get("toolCallId", "") or event.get("id", "")
+            tool_name = event.get("toolName", "")
+            tool_args = event.get("input", "") or tool_input_buffers.get(tool_id, "")
+            if not isinstance(tool_args, str):
+                try:
+                    tool_args = json.dumps(tool_args)
+                except (TypeError, ValueError):
+                    tool_args = ""
+            tool_args = tool_args or tool_input_buffers.get(tool_id, "")
+
+            idx = tool_call_index.get(tool_id)
+            if idx is None:
+                idx = next_tool_index
+                tool_call_index[tool_id] = idx
+                next_tool_index += 1
+
+            chunk = {
+                "id": chat_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": idx,
+                            "id": tool_id,
+                            "type": "function",
+                            "function": {"name": tool_name, "arguments": tool_args},
+                        }]
+                    },
+                    "finish_reason": None,
+                }],
+            }
+            yield f"data: {json.dumps(chunk)}\n\n"
+            tool_input_buffers.pop(tool_id, None)
+
+        elif etype == "finish":
+            finish_reason = _v3_finish_reason(event.get("finishReason", "stop"))
+            usage_data = event.get("usage", {})
+            usage = _v3_usage_to_openai(usage_data) if usage_data else None
+            yield _sse_chunk(chat_id, model, finish_reason=finish_reason, usage=usage)
+            finished = True
+            break
+
+        elif etype in ("error",):
+            yield _sse_chunk(chat_id, model, finish_reason="stop")
+            finished = True
+            break
+
+    yield "data: [DONE]\n\n"
+
+
+# --------------------------------------------------------------------------- #
+# Non-streaming helper: collect a v3 SSE stream into one OpenAI response
+# --------------------------------------------------------------------------- #
+
+
+def v3_sse_stream_to_openai(
+    events: Iterator[dict],
+    model: str = "",
+) -> dict:
+    """Consume a v3 SSE stream (as an iterator of parsed events) and return
+    a single OpenAI chat.completion dict.
+
+    Used by the server for non-streaming mode.
+    """
+    chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    text_parts: list[str] = []
+    tool_calls: list[dict] = []
+    finish_reason = "stop"
+    usage_data: dict = {}
+
+    for event in events:
+        etype = event.get("type", "")
+        if etype == "text-delta":
+            text_parts.append(event.get("delta", ""))
+        elif etype == "tool-call":
+            tool_id = event.get("toolCallId", "") or event.get("id", "")
+            tool_name = event.get("toolName", "")
+            tool_args = event.get("input", "")
+            if not isinstance(tool_args, str):
+                try:
+                    tool_args = json.dumps(tool_args)
+                except (TypeError, ValueError):
+                    tool_args = "{}"
+            tool_calls.append({
+                "id": tool_id,
+                "type": "function",
+                "function": {"name": tool_name, "arguments": tool_args},
+            })
+        elif etype == "finish":
+            finish_reason = _v3_finish_reason(event.get("finishReason", "stop"))
+            usage_data = event.get("usage", {})
+            break
+        elif etype == "error":
+            finish_reason = "stop"
+            break
+
+    full_text = "".join(text_parts)
+    return {
+        "id": chat_id,
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": full_text if full_text else (None if tool_calls else ""),
+                **({"tool_calls": tool_calls} if tool_calls else {}),
+            },
+            "finish_reason": finish_reason,
+        }],
+        "usage": _v3_usage_to_openai(usage_data) if usage_data else {},
+    }
+
+
+# --------------------------------------------------------------------------- #
 # CLI (optional)
 # --------------------------------------------------------------------------- #
 
@@ -464,22 +676,24 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 2:
-        print("Usage: python converter.py <input.json> [--stream]")
+        print("Usage: python converter.py <input.json> [--stream] [--reverse]")
         sys.exit(1)
 
     with open(sys.argv[1]) as f:
         data = json.load(f)
 
     is_stream = "--stream" in sys.argv
+    is_reverse = "--reverse" in sys.argv
+
     if is_stream:
         events = data if isinstance(data, list) else [data]
         print(v3_stream_to_openai(events))
+    elif is_reverse:
+        # v3 -> OpenAI
+        print(json.dumps(v3_to_openai(data), indent=2))
+    elif "prompt" in data:
+        # Already v3 — convert to OpenAI format for inspection.
+        print(json.dumps(v3_to_openai(data), indent=2))
     else:
-        # Try v3_to_openai first; if it doesn't look like v3, try openai_to_v3.
-        has_prompt = "prompt" in data
-        if has_prompt:
-            # Already v3, pass through (echo)
-            print(json.dumps(data, indent=2))
-        else:
-            # OpenAI -> v3
-            print(json.dumps(openai_to_v3(data), indent=2))
+        # OpenAI -> v3
+        print(json.dumps(openai_to_v3(data), indent=2))
