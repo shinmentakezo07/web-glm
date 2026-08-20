@@ -1109,31 +1109,16 @@ git commit -m "feat: fx/0.0.4 user agent and session header passthrough"
 
 ---
 
-### Task 8: Docs — CLAUDE.md, SAUCE.md, README.md, .env.example
+### Task 8: Docs — SAUCE.md, README.md, .env.example
 
 **Files:**
 - Modify: `gateway-proxy/SAUCE.md`, `gateway-proxy/README.md`, `gateway-proxy/.env.example`
-- Modify: `CLAUDE.md` (repo root; the two-layer split note and test command line only)
 
 **Interfaces:** none (docs only).
 
-- [ ] **Step 1: Update CLAUDE.md (repo root)**
+Note: repo-root `CLAUDE.md` is an untracked user file — do not modify or commit it (user ruling).
 
-- Under Tooling, change `uv run pytest tests/` comment and `test_converter.py::TestOpenAIToV3` to the new files:
-  ```bash
-  uv run pytest tests/                                 # unit tests for the converter package
-  uv run pytest tests/test_request.py::TestOpenAIToV3  # single test class
-  ```
-- In "Two-layer split", replace the converter.py bullet with:
-  ```text
-  - **`converter/`** — pure functions, no I/O. OpenAI ↔ AI SDK v3 translation
-    (`request.py`, `parts.py`, `response.py`, `streaming.py`, `responses.py`)
-    + `validation.py` (tool-history validation). Add request/response-shape
-    work here, with tests in `tests/test_*.py` mirroring the module layout.
-  ```
-- In "Protocol invariants", change `User-Agent: fx/0.0.3` to `User-Agent: fx/0.0.4` and update the two `converter.py` mentions to `converter/`.
-
-- [ ] **Step 2: Update SAUCE.md**
+- [ ] **Step 1: Update SAUCE.md**
 
 Make these specific edits:
 - Step 3 header capture: change `User-Agent: fx/0.0.3` to `User-Agent: fx/0.0.4` and add the new headers to the captured list: `x-vercel-ai-gateway-team` (when set), `x-session-id`, `x-session-affinity` (when session pinning is used).
@@ -1169,12 +1154,12 @@ Make these specific edits:
   ```
 - In "Gotchas and edge cases", change item 8 to note the key location comment and add: session headers (`x-session-id`/`x-session-affinity`) are forwarded when the client sends them.
 
-- [ ] **Step 3: Update README.md**
+- [ ] **Step 2: Update README.md**
 
 - "Key headers the proxy sends": change `User-Agent: fx/0.0.3` to `User-Agent: fx/0.0.4`; add `x-session-id` / `x-session-affinity` lines noting they are sent only when configured.
 - In "Notes", add: the body-level `headers.user-agent` is only sent for `zai/glm-5.2` (override with `PRODUCT_USER_AGENT_MODELS`).
 
-- [ ] **Step 4: Update .env.example**
+- [ ] **Step 3: Update .env.example**
 
 Append:
 ```bash
@@ -1191,15 +1176,17 @@ Append:
 # GATEWAY_SESSION_AFFINITY=
 ```
 
-- [ ] **Step 5: Verify no stale references remain**
+- [ ] **Step 4: Verify no stale references remain**
 
 Run: `cd /teamspace/studios/this_studio/Fionn && rg -n "fx/0\.0\.3|fx-converter" --glob '!docs/superpowers/**'`
 Expected: no matches (spec/plan docs may mention them as historical notes).
 
-- [ ] **Step 6: Commit**
+Note: `CLAUDE.md` (repo root) remains untouched and untracked per user ruling.
+
+- [ ] **Step 5: Commit**
 
 ```bash
-git add gateway-proxy/SAUCE.md gateway-proxy/README.md gateway-proxy/.env.example CLAUDE.md
+git add gateway-proxy/SAUCE.md gateway-proxy/README.md gateway-proxy/.env.example
 git commit -m "docs: align proxy docs with current fx wire format"
 ```
 
