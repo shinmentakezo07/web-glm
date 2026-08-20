@@ -15,6 +15,24 @@ import json
 # --------------------------------------------------------------------------- #
 
 
+def _image_url_to_v3_part(url: str) -> dict:
+    """Map an OpenAI image_url value to a v3 content part.
+
+    Data URLs use the current fx wire shape:
+        {"type": "file", "mediaType": "<mime>", "data": "<base64>"}
+    Remote http(s) URLs can't be fetched by this pure converter, so they
+    keep the AI SDK image part shape: {"type": "image", "image": "<url>"}.
+    """
+    if isinstance(url, str) and url.startswith("data:"):
+        header, _, data = url.partition(",")
+        media_type = "application/octet-stream"
+        params = header[len("data:"):].split(";") if len(header) > len("data:") else []
+        if params and params[0]:
+            media_type = params[0]
+        return {"type": "file", "mediaType": media_type, "data": data}
+    return {"type": "image", "image": url}
+
+
 def _openai_content_to_v3_parts(content) -> list[dict]:
     """Convert OpenAI message content to v3 array-of-parts format.
 
@@ -37,7 +55,7 @@ def _openai_content_to_v3_parts(content) -> list[dict]:
                     parts.append({"type": "text", "text": part.get("text", "")})
                 elif part.get("type") == "image_url":
                     url = part.get("image_url", {}).get("url", "")
-                    parts.append({"type": "image", "image": url})
+                    parts.append(_image_url_to_v3_part(url))
                 else:
                     parts.append(part)
             else:

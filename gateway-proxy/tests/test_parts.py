@@ -6,6 +6,7 @@ tool calls as content parts with raw-JSON `input`).
 """
 
 from converter.parts import (
+    _image_url_to_v3_part,
     _normalize_tool_choice,
     _openai_content_to_v3_parts,
     _openai_tool_call_to_v3,
@@ -41,8 +42,28 @@ class TestContentParts:
         ])
         assert parts == [
             {"type": "text", "text": "see image"},
-            {"type": "image", "image": "data:image/png;base64,abc"},
+            {"type": "file", "mediaType": "image/png", "data": "abc"},
         ]
+
+
+class TestImageParts:
+    def test_data_url_becomes_file_part(self):
+        part = _image_url_to_v3_part("data:image/png;base64,iVBORw0KGgo=")
+        assert part == {"type": "file", "mediaType": "image/png", "data": "iVBORw0KGgo="}
+
+    def test_data_url_without_mime_defaults_octet_stream(self):
+        part = _image_url_to_v3_part("data:;base64,AAAA")
+        assert part == {"type": "file", "mediaType": "application/octet-stream", "data": "AAAA"}
+
+    def test_remote_url_stays_image_part(self):
+        part = _image_url_to_v3_part("https://example.com/a.png")
+        assert part == {"type": "image", "image": "https://example.com/a.png"}
+
+    def test_content_to_v3_parts_maps_image_url_to_file_part(self):
+        parts = _openai_content_to_v3_parts([
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAAA"}},
+        ])
+        assert parts == [{"type": "file", "mediaType": "image/jpeg", "data": "AAAA"}]
 
 
 # =====================================================================
