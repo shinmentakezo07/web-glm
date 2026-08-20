@@ -181,3 +181,93 @@ class TestNonStreamingCollection:
         result = v3_sse_stream_to_openai(iter([]))
         assert result["choices"][0]["message"]["content"] == ""
         assert result["choices"][0]["finish_reason"] == "stop"
+
+
+# =====================================================================
+# New fx streaming events (Task 6)
+# =====================================================================
+
+
+class TestStreamingNewEvents:
+    def _data_chunks(self, sse):
+        return [json.loads(l[6:]) for l in sse.split("\n\n") if l.startswith("data: ") and "[DONE]" not in l]
+
+    def test_reasoning_delta_becomes_reasoning_content(self):
+        events = [
+            {"type": "reasoning-start", "id": "r1"},
+            {"type": "reasoning-delta", "id": "r1", "delta": "let me think"},
+            {"type": "reasoning-delta", "id": "r1", "delta": " harder"},
+            {"type": "reasoning-end", "id": "r1"},
+            {"type": "text-delta", "delta": "answer"},
+            {"type": "finish", "finishReason": "stop"},
+        ]
+        sse = v3_stream_to_openai(events, model="gpt-4")
+        reasoning = [c["choices"][0]["delta"].get("reasoning_content")
+                     for c in self._data_chunks(sse)
+                     if c["choices"][0]["delta"].get("reasoning_content")]
+        assert reasoning == ["let me think", " harder"]
+
+    def test_finish_step_usage_fallback(self):
+        events = [
+            {"type": "text-delta", "delta": "x"},
+            {"type": "finish-step", "usage": {"inputTokens": {"total": 4}, "outputTokens": {"total": 2}}},
+            {"type": "finish", "finishReason": "stop"},
+        ]
+        sse = v3_stream_to_openai(events)
+        chunks = self._data_chunks(sse)
+        finish = next(c for c in chunks if c["choices"][0]["finish_reason"] == "stop")
+        assert finish["usage"]["total_tokens"] == 6
+
+    def test_finish_usage_wins_over_step_usage(self):
+        events = [
+            {"type": "finish-step", "usage": {"inputTokens": {"total": 4}, "outputTokens": {"total": 2}}},
+            {"type": "finish", "finishReason": "stop", "usage": {"inputTokens": {"total": 9}, "outputTokens": {"total": 1}}},
+        ]
+        sse = v3_stream_to_openai(events)
+        chunks = self._data_chunks(sse)
+        finish = next(c for c in chunks if c["choices"][0]["finish_reason"] == "stop")
+        assert finish["usage"]["total_tokens"] == 10
+
+    def test_extra_events_do_not_break_stream(self):
+        events = [
+            {"type": "start"},
+            {"type": "start-step", "id": "s1"},
+            {"type": "source", "source": {}},
+            {"type": "file", "file": {}},
+            {"type": "raw", "raw": {}},
+            {"type": "tool-result", "toolCallId": "c1", "toolName": "t", "output": {"type": "text", "value": "ok"}},
+            {"type": "text-delta", "delta": "hi"},
+            {"type": "finish", "finishReason": "stop"},
+        ]
+        sse = v3_stream_to_openai(events, model="m")
+        assert "hi" in sse
+        assert sse.rstrip().endswith("data: [DONE]")
+
+    def test_unknown_event_ignored(self):
+        events = [
+            {"type": "mystery-event", "payload": {}},
+            {"type": "text-delta", "delta": "ok"},
+            {"type": "finish", "finishReason": "stop"},
+        ]
+        sse = v3_stream_to_openai(events, model="m")
+        assert "ok" in sse
+        assert sse.rstrip().endswith("data: [DONE]")
+
+    def test_response_metadata_sets_model_when_empty(self):
+        events = [
+            {"type": "response-metadata", "id": "x", "modelId": "glm52"},
+            {"type": "text-delta", "delta": "hi"},
+            {"type": "finish", "finishReason": "stop"},
+        ]
+        sse = v3_stream_to_openai(events, model="")
+        chunks = self._data_chunks(sse)
+        assert all(c["model"] == "glm52" for c in chunks)
+
+    def test_non_stream_collector_uses_step_usage_fallback(self):
+        events = [
+            {"type": "text-delta", "delta": "x"},
+            {"type": "finish-step", "usage": {"inputTokens": {"total": 4}, "outputTokens": {"total": 2}}},
+            {"type": "finish", "finishReason": "stop"},
+        ]
+        result = v3_sse_stream_to_openai(iter(events), model="m")
+        assert result["usage"] == {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}

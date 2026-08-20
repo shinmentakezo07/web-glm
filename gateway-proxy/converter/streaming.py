@@ -27,12 +27,15 @@ def _sse_chunk(
     finish_reason: str | None = None,
     role: str | None = None,
     usage: dict | None = None,
+    reasoning_delta: str | None = None,
 ) -> str:
     delta: dict = {}
     if role:
         delta["role"] = role
     if delta_text:
         delta["content"] = delta_text
+    if reasoning_delta:
+        delta["reasoning_content"] = reasoning_delta
     chunk = {
         "id": chat_id,
         "object": "chat.completion.chunk",
@@ -55,6 +58,7 @@ class _StreamState:
         self.tool_input_buffers: dict[str, str] = {}
         self.tool_call_index: dict[str, int] = {}
         self.next_tool_index = 0
+        self.last_step_usage: dict = {}
         self.finished = False
 
 
@@ -115,10 +119,31 @@ def _process_stream_event(state: _StreamState, event: dict) -> list[str]:
 
     elif etype == "finish":
         finish_reason = _v3_finish_reason(event.get("finishReason", "stop"))
-        usage_data = event.get("usage", {})
+        usage_data = event.get("usage", {}) or state.last_step_usage or {}
         usage = _v3_usage_to_openai(usage_data) if (usage_data and state.include_usage) else None
         chunks.append(_sse_chunk(state.chat_id, state.model, finish_reason=finish_reason, usage=usage))
         state.finished = True
+
+    elif etype == "reasoning-delta":
+        delta = event.get("delta", "")
+        if delta:
+            chunks.append(_sse_chunk(state.chat_id, state.model, reasoning_delta=delta))
+
+    elif etype == "finish-step":
+        usage_data = event.get("usage", {})
+        if usage_data:
+            state.last_step_usage = usage_data
+
+    elif etype == "response-metadata":
+        if not state.model and event.get("modelId"):
+            state.model = event["modelId"]
+
+    elif etype in (
+        "start", "start-step", "tool-result", "source", "file", "raw",
+        "text-start", "text-end", "reasoning-start", "reasoning-end",
+        "tool-input-start", "tool-input-end",
+    ):
+        pass  # explicitly handled no-ops: no OpenAI chunk for these
 
     elif etype == "error":
         # Stream ended with an upstream error.
@@ -142,6 +167,13 @@ def v3_stream_to_openai(
     server streams incrementally via `v3_stream_iter`.
     """
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    # If the client supplied no model, resolve it from response-metadata before
+    # emitting the leading role chunk so every chunk carries the final model.
+    if not model:
+        for ev in events:
+            if ev.get("type") == "response-metadata" and ev.get("modelId"):
+                model = ev["modelId"]
+                break
     chunks: list[str] = [_sse_chunk(chat_id, model, role="assistant")]
     state = _StreamState(chat_id, model, include_usage)
     for event in events:
@@ -194,6 +226,7 @@ def v3_sse_stream_to_openai(
     tool_calls: list[dict] = []
     finish_reason = "stop"
     usage_data: dict = {}
+    step_usage: dict = {}
 
     for event in events:
         etype = event.get("type", "")
@@ -213,9 +246,13 @@ def v3_sse_stream_to_openai(
                 "type": "function",
                 "function": {"name": tool_name, "arguments": tool_args},
             })
+        elif etype == "finish-step":
+            if event.get("usage"):
+                step_usage = event["usage"]
         elif etype == "finish":
             finish_reason = _v3_finish_reason(event.get("finishReason", "stop"))
-            usage_data = event.get("usage", {})
+            usage_data = event.get("usage", {}) or step_usage or {}
+            usage_data = usage_data or {}
             break
         elif etype == "error":
             finish_reason = "stop"
