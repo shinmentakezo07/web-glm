@@ -13,3 +13,8 @@ dependencies = [
 dev = [
     "pytest>=8.0",
 ]
+
+[tool.pytest.ini_options]
+# Make the project root importable so `uv run pytest tests/` can resolve
+# the `converter` package and `server` (pytest console scripts do not add cwd).
+pythonpath = ["."]

@@ -59,11 +59,10 @@ from fastapi import FastAPI, Request, HTTPException, Depends, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.responses import StreamingResponse, JSONResponse
 
-from converter import (
-    openai_to_v3,
-    validate_tool_history,
-    v3_stream_iter,
-    v3_sse_stream_to_openai,
+from converter.request import openai_to_v3
+from converter.validation import validate_tool_history
+from converter.streaming import v3_stream_iter, v3_sse_stream_to_openai
+from converter.responses import (
     responses_input_to_messages,
     openai_to_responses,
     openai_chunk_to_responses_sse,
