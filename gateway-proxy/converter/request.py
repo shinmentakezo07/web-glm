@@ -19,7 +19,7 @@ from .parts import (
 def openai_to_v3(
     body: dict,
     *,
-    product_user_agent: str = "fx/0.0.4",
+    product_user_agent: str = "fx/0.0.5",
     product_user_agent_models: frozenset[str] | None = frozenset({"zai/glm-5.2"}),
 ) -> dict:
     """Convert an OpenAI chat-completions request to AI SDK v3 format.

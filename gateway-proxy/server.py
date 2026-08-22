@@ -9,7 +9,7 @@ the **same v3 AI SDK protocol** the native fx CLI uses:
 
     Headers:
       Authorization: Bearer <gateway_key>
-      User-Agent: fx/0.0.4
+      User-Agent: fx/<latest>           (auto-synced from GitHub at startup)
       HTTP-Referer: https://github.com/vercel-labs/fx
       X-Title: fx
       ai-gateway-protocol-version: 0.0.1
@@ -60,7 +60,8 @@ except ImportError:
 import httpx
 from fastapi import FastAPI, Request, HTTPException, Depends, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from converter.request import openai_to_v3
 from converter.validation import validate_tool_history
@@ -80,7 +81,7 @@ from converter.anthropic import (
 
 import identity
 from keys import KeyPool, load_keys, mask
-from usage import UsageTracker
+from db import UsageStore
 
 # --------------------------------------------------------------------------- #
 # Configuration
@@ -89,7 +90,7 @@ from usage import UsageTracker
 GATEWAY_BASE_URL = os.getenv("GATEWAY_BASE_URL", "https://ai-gateway.vercel.sh")
 GATEWAY_KEYS = load_keys()
 KEY_POOL = KeyPool(GATEWAY_KEYS)
-USAGE = UsageTracker(
+USAGE = UsageStore(
     enabled=os.getenv("USAGE_TRACKING", "1").lower() in ("1", "true", "yes", "on")
 )
 GATEWAY_TEAM = os.getenv("GATEWAY_TEAM", "")
@@ -132,6 +133,15 @@ logging.basicConfig(
 )
 log = logging.getLogger("gateway-proxy")
 
+# Also write logs to a file so the dashboard can read them back.
+LOG_FILE = os.getenv("LOG_FILE", os.path.join(os.getcwd(), "proxy.log"))
+try:
+    _file_handler = logging.FileHandler(LOG_FILE)
+    _file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    log.addHandler(_file_handler)
+except OSError:
+    pass
+
 bearer = HTTPBearer(auto_error=False)
 
 
@@ -167,6 +177,9 @@ async def lifespan(app: FastAPI):
     if not PROXY_API_KEY:
         log.warning("PROXY_API_KEY not set — proxy is open to all callers")
     if not client_injected:
+        # Fetch the live fx identity (GitHub + local binary) before serving
+        # any request, then start the periodic background refresher.
+        await identity.initialize(app.state)
         app.state.identity_task = identity.start(app.state)
     yield
     task: asyncio.Task | None = getattr(app.state, "identity_task", None)
@@ -176,6 +189,23 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="fx-style AI Gateway proxy", lifespan=lifespan)
+
+# Serve the dashboard UI (pre-built Vite React app) from /dashboard/static/.
+_DASHBOARD_DIR = os.path.join(os.path.dirname(__file__), "dashboard", "dist")
+if os.path.isdir(_DASHBOARD_DIR):
+    app.mount("/dashboard/static", StaticFiles(directory=_DASHBOARD_DIR), name="dashboard-static")
+
+
+@app.get("/dashboard")
+async def dashboard_page():
+    """Serve the dashboard SPA (or a fallback if not built yet)."""
+    index = os.path.join(_DASHBOARD_DIR, "index.html")
+    if os.path.isfile(index):
+        return FileResponse(index)
+    return JSONResponse(
+        status_code=404,
+        content={"error": "Dashboard not built. Run: cd dashboard && npm run build"},
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -288,7 +318,7 @@ def _v3_headers(
     headers: dict[str, str] = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        "User-Agent": identity.state["user_agent"],
+        "User-Agent": identity.state["user_agent"] or identity._FALLBACK_USER_AGENT,
         "HTTP-Referer": "https://github.com/vercel-labs/fx",
         "X-Title": "fx",
         "ai-gateway-protocol-version": identity.state["protocol_version"],
@@ -386,6 +416,18 @@ def _int_tokens(value) -> int:
         return 0
 
 
+def _extract_usage(u: dict) -> dict:
+    """Extract all token fields from an OpenAI-shaped usage dict."""
+    pt = u.get("prompt_tokens_details") or {}
+    ct = u.get("output_tokens_details") or {}
+    return {
+        "prompt_tokens": _int_tokens(u.get("prompt_tokens")),
+        "completion_tokens": _int_tokens(u.get("completion_tokens")),
+        "cached_tokens": _int_tokens(pt.get("cached_tokens")),
+        "reasoning_tokens": _int_tokens(ct.get("reasoning_tokens")),
+    }
+
+
 def _iter_remote_image_parts(messages: list) -> list[tuple[dict, int]]:
     """Collect (message, index) pairs of remote http(s) image_url parts."""
     targets: list[tuple[dict, int]] = []
@@ -438,10 +480,11 @@ async def _hydrate_remote_images(client: httpx.AsyncClient, body: dict) -> None:
 
 
 async def _tracked_stream(
-    aiter: AsyncIterator[str], caller: str, model: str
+    aiter: AsyncIterator[str], caller: str, model: str, endpoint: str = ""
 ) -> AsyncIterator[str]:
     """Pass-through SSE generator that extracts usage from the final chunk."""
     saw_usage = False
+    start = time.monotonic()
     async for sse in aiter:
         if '"usage"' in sse and not saw_usage:
             try:
@@ -451,19 +494,14 @@ async def _tracked_stream(
                 elif payload.startswith("data:"):
                     payload = payload[5:]
                 data = json.loads(payload)
-                u = data.get("usage") or {}
-                USAGE.record(
-                    caller,
-                    model=model,
-                    prompt_tokens=_int_tokens(u.get("prompt_tokens")),
-                    completion_tokens=_int_tokens(u.get("completion_tokens")),
-                )
+                u = _extract_usage(data.get("usage") or {})
+                USAGE.record(caller, model=model, endpoint=endpoint, duration_ms=(time.monotonic() - start) * 1000, **u)
                 saw_usage = True
             except Exception:
                 pass
         yield sse
     if not saw_usage:
-        USAGE.record(caller, model=model)
+        USAGE.record(caller, model=model, endpoint=endpoint, duration_ms=(time.monotonic() - start) * 1000)
 
 
 async def _send_upstream(
@@ -603,7 +641,7 @@ async def _send_to_v3(
     await _hydrate_remote_images(client, chat_body)
     v3_body = openai_to_v3(
         chat_body,
-        product_user_agent=identity.state["user_agent"],
+        product_user_agent=identity.state["user_agent"] or identity._FALLBACK_USER_AGENT,
         product_user_agent_models=PRODUCT_USER_AGENT_MODELS,
     )
     url = urljoin(GATEWAY_BASE_URL + "/", GATEWAY_V3_CHAT.lstrip("/"))
@@ -644,6 +682,31 @@ async def healthz():
 async def usage_stats(_: str = Depends(verify_proxy_key)):
     """Per-caller request/token counters recorded since process start."""
     return USAGE.snapshot()
+
+
+@app.get("/v1/dashboard")
+async def dashboard_stats():
+    """Dashboard payload: totals, time series, per-model/caller breakdowns.
+
+    No auth — internal monitoring tool for the operator, not exposed to
+    proxy callers.
+    """
+    return USAGE.dashboard()
+
+
+@app.get("/v1/logs")
+async def logs_api(limit: int = 200):
+    """Recent proxy log lines for the dashboard. No auth."""
+    limit = max(1, min(limit, 1000))
+    lines: list[str] = []
+    try:
+        with open(LOG_FILE, "r", errors="replace") as f:
+            # Read the last `limit` lines efficiently
+            all_lines = f.readlines()
+            lines = all_lines[-limit:]
+    except (OSError, FileNotFoundError):
+        pass
+    return {"lines": lines, "file": LOG_FILE}
 
 
 @app.get("/v1/models")
@@ -709,7 +772,7 @@ async def chat_completions(request: Request, _: str = Depends(verify_proxy_key))
 
     v3_body = openai_to_v3(
         body,
-        product_user_agent=identity.state["user_agent"],
+        product_user_agent=identity.state["user_agent"] or identity._FALLBACK_USER_AGENT,
         product_user_agent_models=PRODUCT_USER_AGENT_MODELS,
     )
     url = urljoin(GATEWAY_BASE_URL + "/", GATEWAY_V3_CHAT.lstrip("/"))
@@ -730,8 +793,10 @@ async def chat_completions(request: Request, _: str = Depends(verify_proxy_key))
     log.debug("POST /v1/chat/completions via gateway key %s", mask(used_key))
 
     caller = request.client.host if request.client else "unknown"
+    _req_start = time.monotonic()
     if resp.status_code != 200:
-        USAGE.record(caller, model=model, error=True)
+        USAGE.record(caller, model=model, endpoint="/v1/chat/completions", error=True,
+                     duration_ms=(time.monotonic() - _req_start) * 1000)
 
     if stream:
         if resp.status_code != 200:
@@ -739,7 +804,7 @@ async def chat_completions(request: Request, _: str = Depends(verify_proxy_key))
             await resp.aclose()
             return err_resp
         return StreamingResponse(
-            _tracked_stream(_chat_stream(resp, model, include_usage), caller, model),
+            _tracked_stream(_chat_stream(resp, model, include_usage), caller, model, "/v1/chat/completions"),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -752,13 +817,9 @@ async def chat_completions(request: Request, _: str = Depends(verify_proxy_key))
         result = await _collect_response(resp, model)
     finally:
         await resp.aclose()
-    _u = result.get("usage") or {}
-    USAGE.record(
-        caller,
-        model=model,
-        prompt_tokens=_int_tokens(_u.get("prompt_tokens")),
-        completion_tokens=_int_tokens(_u.get("completion_tokens")),
-    )
+    _u = _extract_usage(result.get("usage") or {})
+    USAGE.record(caller, model=model, endpoint="/v1/chat/completions",
+                 duration_ms=(time.monotonic() - _req_start) * 1000, **_u)
     return JSONResponse(content=result)
 
 
@@ -794,7 +855,7 @@ async def responses_route(request: Request, _: str = Depends(verify_proxy_key)):
 
     v3_body = openai_to_v3(
         chat_body,
-        product_user_agent=identity.state["user_agent"],
+        product_user_agent=identity.state["user_agent"] or identity._FALLBACK_USER_AGENT,
         product_user_agent_models=PRODUCT_USER_AGENT_MODELS,
     )
     url = urljoin(GATEWAY_BASE_URL + "/", GATEWAY_V3_CHAT.lstrip("/"))
@@ -815,8 +876,10 @@ async def responses_route(request: Request, _: str = Depends(verify_proxy_key)):
     log.debug("POST /v1/responses via gateway key %s", mask(used_key))
 
     caller = request.client.host if request.client else "unknown"
+    _req_start = time.monotonic()
     if resp.status_code != 200:
-        USAGE.record(caller, model=model, error=True)
+        USAGE.record(caller, model=model, endpoint="/v1/responses", error=True,
+                     duration_ms=(time.monotonic() - _req_start) * 1000)
 
     if stream:
         if resp.status_code != 200:
@@ -824,7 +887,7 @@ async def responses_route(request: Request, _: str = Depends(verify_proxy_key)):
             await resp.aclose()
             return err_resp
         return StreamingResponse(
-            _tracked_stream(_responses_stream(resp, model), caller, model),
+            _tracked_stream(_responses_stream(resp, model), caller, model, "/v1/responses"),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -837,13 +900,9 @@ async def responses_route(request: Request, _: str = Depends(verify_proxy_key)):
         result = await _collect_response(resp, model)
     finally:
         await resp.aclose()
-    _u = result.get("usage") or {}
-    USAGE.record(
-        caller,
-        model=model,
-        prompt_tokens=_int_tokens(_u.get("prompt_tokens")),
-        completion_tokens=_int_tokens(_u.get("completion_tokens")),
-    )
+    _u = _extract_usage(result.get("usage") or {})
+    USAGE.record(caller, model=model, endpoint="/v1/responses",
+                 duration_ms=(time.monotonic() - _req_start) * 1000, **_u)
     return JSONResponse(content=openai_to_responses(result, model))
 
 
@@ -868,17 +927,15 @@ async def embeddings(request: Request, _: str = Depends(verify_proxy_key)):
     resp, used_key = await _upstream_pooled(send)
     log.debug("POST /v1/embeddings via gateway key %s", mask(used_key))
     caller = request.client.host if request.client else "unknown"
+    _req_start = time.monotonic()
     if resp.status_code != 200:
-        USAGE.record(caller, model=model, error=True)
+        USAGE.record(caller, model=model, endpoint="/v1/embeddings", error=True,
+                     duration_ms=(time.monotonic() - _req_start) * 1000)
         return _client_error(resp)
     data = resp.json()
-    _u = data.get("usage") or {}
-    USAGE.record(
-        caller,
-        model=model,
-        prompt_tokens=_int_tokens(_u.get("prompt_tokens")),
-        completion_tokens=_int_tokens(_u.get("completion_tokens")),
-    )
+    _u = _extract_usage(data.get("usage") or {})
+    USAGE.record(caller, model=model, endpoint="/v1/embeddings",
+                 duration_ms=(time.monotonic() - _req_start) * 1000, **_u)
     return JSONResponse(content=data)
 
 
@@ -961,15 +1018,17 @@ async def anthropic_messages(request: Request, _: str = Depends(verify_anthropic
     log.debug("POST /v1/messages via gateway key %s", mask(used_key))
 
     caller = request.client.host if request.client else "unknown"
+    _req_start = time.monotonic()
     if resp.status_code != 200:
-        USAGE.record(caller, model=model, error=True)
+        USAGE.record(caller, model=model, endpoint="/v1/messages", error=True,
+                     duration_ms=(time.monotonic() - _req_start) * 1000)
         err_resp = _anthropic_error(resp)
         await resp.aclose()
         return err_resp
 
     if stream:
         return StreamingResponse(
-            _tracked_stream(_anthropic_stream(resp, model), caller, model),
+            _tracked_stream(_anthropic_stream(resp, model), caller, model, "/v1/messages"),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -978,13 +1037,9 @@ async def anthropic_messages(request: Request, _: str = Depends(verify_anthropic
         result = await _collect_response(resp, model)
     finally:
         await resp.aclose()
-    _u = result.get("usage") or {}
-    USAGE.record(
-        caller,
-        model=model,
-        prompt_tokens=_int_tokens(_u.get("prompt_tokens")),
-        completion_tokens=_int_tokens(_u.get("completion_tokens")),
-    )
+    _u = _extract_usage(result.get("usage") or {})
+    USAGE.record(caller, model=model, endpoint="/v1/messages",
+                 duration_ms=(time.monotonic() - _req_start) * 1000, **_u)
     return JSONResponse(content=openai_to_anthropic(result, model))
 
 

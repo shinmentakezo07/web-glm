@@ -308,7 +308,7 @@ makes it different from OpenAI:
   "stopSequences": ["END"],
   "responseFormat": {"type": "json", "name": "my_schema", "schema": {...}},
   "reasoning": "high",
-  "headers": {"user-agent": "fx/0.0.4"},
+  "headers": {"user-agent": "fx/0.0.5"},
   "providerOptions": {}
 }
 ```

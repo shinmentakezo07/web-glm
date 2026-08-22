@@ -7,11 +7,14 @@ lets us assert the wire format the proxy actually sends upstream.
 
 import json
 import os
+import tempfile
 
 os.environ["PROXY_API_KEY"] = "test-proxy-key"
 os.environ["AI_GATEWAY_API_KEY"] = "test-gateway-key"
 os.environ["GATEWAY_HTTP2"] = "0"
 os.environ["MODELS_CACHE_TTL"] = "300"
+os.environ["USAGE_TRACKING"] = "0"
+os.environ["USAGE_DB_PATH"] = os.path.join(tempfile.gettempdir(), "test_usage.db")
 
 import httpx
 from fastapi.testclient import TestClient
@@ -109,6 +112,9 @@ def make_router(calls: list[dict]) -> httpx.MockTransport:
 
 
 def setup_test_client(calls: list[dict]) -> TestClient:
+    # Disable usage recording during tests so test models (gpt-4, claude-3)
+    # don't pollute the real usage.db.
+    server.USAGE.enabled = False
     server.app.state.client = httpx.AsyncClient(
         transport=make_router(calls), timeout=httpx.Timeout(5.0)
     )

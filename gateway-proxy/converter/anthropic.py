@@ -492,6 +492,10 @@ class _AnthropicStreamState:
         return out
 
     def finish(self, finish_reason: str | None, usage: dict | None) -> str:
+        # Record that we've terminated, so the post-loop guard in
+        # anthropic_stream_iter doesn't re-fire finish() (which would emit a
+        # duplicate message_stop when the final chunk carried no usage).
+        self.finish_reason = finish_reason
         out = ""
         # Close open thinking block
         if self.thinking_started:

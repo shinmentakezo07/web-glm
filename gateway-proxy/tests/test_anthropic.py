@@ -641,6 +641,21 @@ class TestAnthropicStreamAsync:
         assert "tool_use" in sse
         assert "message_stop" in sse
 
+    def test_finish_chunk_without_usage_emits_single_message_stop(self):
+        """A finish chunk with no usage must still terminate cleanly with one
+        message_stop — not a duplicate. Regression: finish() never stored
+        finish_reason, so the post-loop guard re-fired finish().
+        """
+        chunk_data = [
+            {"id": "x", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": None}]},
+            {"id": "x", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},  # no usage
+        ]
+        chunks = [f"data: {json.dumps(d)}\n\n" for d in chunk_data]
+        sse = run_anthropic_stream(chunks)
+        stops = sse.count('"type": "message_stop"')
+        assert stops == 1, f"expected exactly one message_stop, got {stops}"
+        assert "message_delta" in sse
+
 
 # =====================================================================
 # Token counting

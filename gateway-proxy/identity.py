@@ -47,11 +47,20 @@ DEFAULT_SPEC_VERSION = "4"
 
 # Single mutable source of truth; server.py reads it via _v3_headers() and
 # openai_to_v3(product_user_agent=...) on every request.
-state: dict[str, str] = {
-    "user_agent": PINNED_USER_AGENT or "fx/0.0.4",
+#
+# user_agent starts as None — it is populated by initialize() during server
+# startup (before any request is served) via a live GitHub fetch or the local
+# fx binary.  If both fail we fall back to the local-binary version or a
+# last-resort default so the proxy never starts with a null User-Agent.
+state: dict[str, str | None] = {
+    "user_agent": PINNED_USER_AGENT or None,
     "protocol_version": DEFAULT_PROTOCOL_VERSION,
     "specification_version": DEFAULT_SPEC_VERSION,
 }
+
+# Last-resort fallback if GitHub fetch fails, no local fx binary, and no
+# FX_USER_AGENT pin.  We use the latest known version at time of writing.
+_FALLBACK_USER_AGENT = "fx/0.0.5"
 
 _PROTOCOL_RE = re.compile(r'"ai-gateway-protocol-version",\s*\.value\s*=\s*"([^"]+)"')
 _SPEC_RE = re.compile(r'"ai-language-model-specification-version",\s*\.value\s*=\s*"([^"]+)"')
@@ -137,8 +146,7 @@ def detect_local_fx_version() -> str | None:
 
     Used as a fallback identity source when the GitHub refresh is disabled
     or unreachable, so the User-Agent never goes stale relative to the fx
-    build actually present on this machine (e.g. repo default ``fx/0.0.4``
-    while ``fx/0.0.5`` is installed).
+    build actually present on this machine.
     """
     import shutil
     import subprocess
@@ -166,6 +174,39 @@ def detect_local_fx_version() -> str | None:
 # --------------------------------------------------------------------------- #
 
 
+async def initialize(app_state: object) -> None:
+    """Fetch the live fx identity before the server starts serving.
+
+    Tries (in order):
+      1. GitHub releases API + raw source (if FX_AUTO_UPDATE is on)
+      2. Local fx binary version (always runs, even with auto-update off)
+      3. Fallback default (so user_agent is never None)
+
+    This runs synchronously during lifespan startup so the very first
+    request already has the live version — no restart needed.
+    """
+    client: httpx.AsyncClient | None = getattr(app_state, "client", None)
+
+    # Always try the local binary first (instant, offline-capable).
+    local_version = detect_local_fx_version()
+    if local_version and not PINNED_USER_AGENT:
+        apply(f"fx/{local_version}", None)
+
+    # Then do a live GitHub fetch for the freshest version + protocol headers.
+    if AUTO_UPDATE and client is not None:
+        await refresh(client)
+
+    # If we still don't have a user_agent (no local fx, GitHub failed, no
+    # pin), fall back to the last-known-good version so the proxy never
+    # starts with a null identity.
+    if not state["user_agent"]:
+        log.warning(
+            "fx identity: no local binary and GitHub fetch failed; "
+            "using fallback %s", _FALLBACK_USER_AGENT,
+        )
+        state["user_agent"] = _FALLBACK_USER_AGENT
+
+
 async def refresher_loop(client: httpx.AsyncClient, interval: float) -> None:
     while True:
         await refresh(client)
@@ -177,17 +218,6 @@ def start(app_state: object) -> asyncio.Task | None:
 
     Returns the task (store it to cancel at shutdown), or None when disabled.
     """
-    # Local-binary fallback runs even with FX_AUTO_UPDATE=0: prefer the
-    # installed fx version over the hardcoded default so the wire identity
-    # stays fresh offline. GitHub refresh remains the primary source.
-    local_version = detect_local_fx_version()
-    if (
-        local_version
-        and not PINNED_USER_AGENT
-        and f"fx/{local_version}" != state["user_agent"]
-    ):
-        log.info("using local fx binary version for identity: fx/%s", local_version)
-        apply(f"fx/{local_version}", None)
     if not AUTO_UPDATE:
         log.info("fx identity auto-update disabled")
         return None
