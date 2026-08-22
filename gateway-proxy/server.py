@@ -384,7 +384,12 @@ async def _tracked_stream(
     async for sse in aiter:
         if '"usage"' in sse and not saw_usage:
             try:
-                data = json.loads(sse[sse.index("{"):sse.rindex("}") + 1])
+                payload = sse.strip()
+                if payload.startswith("data: "):
+                    payload = payload[6:]
+                elif payload.startswith("data:"):
+                    payload = payload[5:]
+                data = json.loads(payload)
                 u = data.get("usage") or {}
                 USAGE.record(
                     caller,
@@ -697,13 +702,17 @@ async def responses_route(request: Request, _: str = Depends(verify_proxy_key)):
     resp, used_key = await _upstream_pooled(send)
     log.debug("POST /v1/responses via gateway key %s", mask(used_key))
 
+    caller = request.client.host if request.client else "unknown"
+    if resp.status_code != 200:
+        USAGE.record(caller, model=model, error=True)
+
     if stream:
         if resp.status_code != 200:
             err_resp = _client_error(resp)
             await resp.aclose()
             return err_resp
         return StreamingResponse(
-            _responses_stream(resp, model),
+            _tracked_stream(_responses_stream(resp, model), caller, model),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -716,7 +725,6 @@ async def responses_route(request: Request, _: str = Depends(verify_proxy_key)):
         result = await _collect_response(resp, model)
     finally:
         await resp.aclose()
-    caller = request.client.host if request.client else "unknown"
     _u = result.get("usage") or {}
     USAGE.record(
         caller,
@@ -747,9 +755,19 @@ async def embeddings(request: Request, _: str = Depends(verify_proxy_key)):
 
     resp, used_key = await _upstream_pooled(send)
     log.debug("POST /v1/embeddings via gateway key %s", mask(used_key))
+    caller = request.client.host if request.client else "unknown"
     if resp.status_code != 200:
+        USAGE.record(caller, model=model, error=True)
         return _client_error(resp)
-    return JSONResponse(content=resp.json())
+    data = resp.json()
+    _u = data.get("usage") or {}
+    USAGE.record(
+        caller,
+        model=model,
+        prompt_tokens=_int_tokens(_u.get("prompt_tokens")),
+        completion_tokens=_int_tokens(_u.get("completion_tokens")),
+    )
+    return JSONResponse(content=data)
 
 
 # --------------------------------------------------------------------------- #
