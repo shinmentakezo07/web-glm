@@ -25,7 +25,7 @@ Your CLI (OpenAI format)
 Proxy (FastAPI on :8787)
     ├─ translates OpenAI → AI SDK v3 format
     ├─ adds fx headers:
-    │    User-Agent: fx/0.0.4
+    │    User-Agent: fx/<version>       (auto-synced from GitHub)
     │    ai-gateway-protocol-version: 0.0.1
     │    ai-language-model-specification-version: 4
     │    HTTP-Referer: https://github.com/vercel-labs/fx
@@ -68,6 +68,7 @@ The proxy supports several upstream gateway keys. List them in `.env`:
 ```env
 AI_GATEWAY_API_KEY_1=vck_first_key
 AI_GATEWAY_API_KEY_2=vck_second_key
+AI_GATEWAY_API_KEY_3=vck_third_key   # up to _20
 ```
 
 With more than one key configured:
@@ -132,29 +133,38 @@ curl http://localhost:8787/v1/models \
   -H "Authorization: Bearer your_proxy_key_here"
 ```
 
+### Check usage
+
+```bash
+curl http://localhost:8787/v1/usage \
+  -H "Authorization: Bearer your_proxy_key_here"
+```
+
 ## Endpoints
 
 | Route | Method | Description |
 |---|---|---|
 | `/v1/chat/completions` | POST | Chat completions (OpenAI format) |
-| `/v1/models` | GET | List available models |
+| `/v1/responses` | POST | OpenAI Responses API (input items → v3) |
+| `/v1/models` | GET | List available models (cached) |
 | `/v1/embeddings` | POST | Embeddings (uses v1 endpoint) |
-| `/healthz` | GET | Health check |
 | `/v1/usage` | GET | Per-caller usage counters since process start |
+| `/healthz` | GET | Health check (reports key pool + usage stats) |
 
 ## Key headers the proxy sends (matching fx CLI)
 
 ```
 Authorization: Bearer <gateway_key>
-User-Agent: fx/0.0.4
+User-Agent: fx/<version>              # auto-synced from GitHub
 HTTP-Referer: https://github.com/vercel-labs/fx
 X-Title: fx
 ai-gateway-protocol-version: 0.0.1
 ai-language-model-specification-version: 4
 ai-language-model-id: <model>
 ai-language-model-streaming: true
-x-session-id: <sid>            # only sent when configured (session pinning)
-x-session-affinity: <affinity> # only sent when configured (session pinning)
+x-vercel-ai-gateway-team: <team>      # only when GATEWAY_TEAM is set
+x-session-id: <sid>                   # only when configured (session pinning)
+x-session-affinity: <affinity>        # only when configured (session pinning)
 ```
 
 ## Notes
@@ -170,13 +180,21 @@ x-session-affinity: <affinity> # only sent when configured (session pinning)
 
 ## Docker
 
+Build from either the repo root or this directory:
+
 ```bash
+# From repo root
+cp gateway-proxy/.env.example gateway-proxy/.env   # set keys first
+docker compose up --build -d
+
+# Or from gateway-proxy/
 cd gateway-proxy
-cp .env.example .env   # set AI_GATEWAY_API_KEY / PROXY_API_KEY first
+cp .env.example .env
 docker compose up --build -d
 ```
 
 The container listens on `${PORT:-8787}` and reuses your `.env` via `env_file`.
+A healthcheck hits `/healthz` every 30 seconds.
 
 ## Remote images & usage tracking
 
@@ -186,7 +204,16 @@ The container listens on `${PORT:-8787}` and reuses your `.env` via `env_file`.
   unchanged; cap size with `IMAGE_FETCH_MAX_BYTES`.
 - **Usage tracking** (`USAGE_TRACKING=1`, default on): request/error/token
   counters per calling client, exposed at `GET /v1/usage` and summarised in
-  `/healthz`. In-memory only; resets on restart.
+  `/healthz`. In-memory only; resets on restart. Tracked on all routes
+  (chat completions, responses, and embeddings — streaming and non-streaming).
 - **Identity fallback**: if the GitHub fx sync is disabled or unreachable,
   the proxy uses the version of any locally installed `fx` binary before
   falling back to the hardcoded default User-Agent.
+
+## Testing
+
+```bash
+uv run pytest tests/                       # full suite (190 tests)
+uv run pytest tests/test_keys.py -v        # key pool + round-robin + failover
+uv run pytest tests/test_streaming.py -v   # streaming conversion
+```

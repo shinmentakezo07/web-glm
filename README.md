@@ -22,6 +22,7 @@ card needed.
 - [Usage](#usage)
 - [Endpoints](#endpoints)
 - [Configuration](#configuration)
+- [Docker](#docker)
 - [Project structure](#project-structure)
 - [Architecture](#architecture)
 - [Protocol invariants](#protocol-invariants)
@@ -51,7 +52,7 @@ Your CLI (OpenAI format)
     ↓
 Fionn (FastAPI on :8787)
     ├─ translates OpenAI → AI SDK v3 format
-    ├─ adds fx headers (User-Agent: fx/0.0.4, ai-gateway-* ...)
+    ├─ adds fx headers (User-Agent: fx/0.0.5, ai-gateway-* ...)
     └─ forwards to https://ai-gateway.vercel.sh/v3/ai/language-model
     ↓
 Gateway (v3 SSE response)
@@ -165,13 +166,14 @@ curl http://localhost:8787/v1/models \
 | `/v1/responses` | POST | OpenAI Responses API (input items → v3) |
 | `/v1/models` | GET | List available models (cached, TTL configurable) |
 | `/v1/embeddings` | POST | Embeddings (forwards to the v1 endpoint) |
-| `/healthz` | GET | Health check |
+| `/v1/usage` | GET | Per-caller usage counters since process start |
+| `/healthz` | GET | Health check (reports key pool + usage stats) |
 
 ### Key headers the proxy sends upstream (matching fx CLI)
 
 ```
 Authorization: Bearer <gateway_key>
-User-Agent: fx/0.0.4
+User-Agent: fx/<version>              # auto-synced from GitHub
 HTTP-Referer: https://github.com/vercel-labs/fx
 X-Title: fx
 ai-gateway-protocol-version: 0.0.1
@@ -183,7 +185,6 @@ x-session-id: <sid>                    # only when configured (session pinning)
 x-session-affinity: <affinity>         # only when configured (session pinning)
 ```
 
-
 ---
 
 ## Configuration
@@ -191,14 +192,31 @@ x-session-affinity: <affinity>         # only when configured (session pinning)
 All configuration is via environment variables (loaded from `.env`). See
 [`gateway-proxy/.env.example`](gateway-proxy/.env.example) for the full list.
 
+### Upstream keys
+
 | Variable | Default | Description |
 |---|---|---|
-| `AI_GATEWAY_API_KEY` | *(empty)* | Your AI Gateway API key (required). At `~/.fx/api-key` if you use the fx CLI. |
+| `AI_GATEWAY_API_KEY` | *(empty)* | Your AI Gateway API key (required). At `~/.fx/api-key` if you use the fx CLI. Comma-separated list accepted. |
+| `AI_GATEWAY_API_KEY_1` .. `_20` | *(empty)* | Numbered keys for multi-key rotation. Override the legacy var on duplicates. |
+| `KEY_ROTATION` | `1` | Round-robin across keys when more than one is set (`0` = always use key 1). |
+| `KEY_FAILOVER` | `1` | On a key-attributable failure (401/402/403/408/429, any 5xx, or network error) transparently retry the next key. |
+| `KEY_COOLDOWN` | `30` | Seconds a failing key sits out of rotation (`0` disables). If all keys cooling, the coolest is still used. |
+
+### Proxy auth & behavior
+
+| Variable | Default | Description |
+|---|---|---|
 | `PROXY_API_KEY` | *(empty)* | Key callers must send as a Bearer token. Empty = open proxy. |
 | `GATEWAY_BASE_URL` | `https://ai-gateway.vercel.sh` | Gateway base URL. |
 | `GATEWAY_TEAM` | *(empty)* | Pin a Vercel team (sends `x-vercel-ai-gateway-team`). |
 | `DEFAULT_MODEL` | `zai/glm-5.2` | Model used when the client doesn't specify one. |
 | `HOST` / `PORT` | `0.0.0.0` / `8787` | Server bind address. |
+| `RELOAD` | *(unset)* | Enable uvicorn reload when set. |
+
+### Timeouts & HTTP
+
+| Variable | Default | Description |
+|---|---|---|
 | `GATEWAY_TIMEOUT_CONNECT` | `15` | Upstream connect timeout (s). |
 | `GATEWAY_TIMEOUT_READ` | `300` | Upstream read timeout (s). |
 | `GATEWAY_TIMEOUT_WRITE` | `60` | Upstream write timeout (s). |
@@ -206,15 +224,49 @@ All configuration is via environment variables (loaded from `.env`). See
 | `GATEWAY_HTTP2` | `1` | Use HTTP/2 to the gateway (`1`/`0`). |
 | `MODELS_CACHE_TTL` | `300` | How long to cache `/v1/models` (s). |
 | `LOG_LEVEL` | `INFO` | Logging level (`DEBUG`/`INFO`/`WARNING`). |
-| `FX_USER_AGENT` | `fx/0.0.4` | User-Agent sent to the gateway (mirrors fx CLI). |
+
+### fx identity alignment
+
+| Variable | Default | Description |
+|---|---|---|
+| `FX_AUTO_UPDATE` | `1` | Auto-sync fx identity (User-Agent + protocol headers) from GitHub. |
+| `FX_REFRESH_SECS` | `3600` | Refresh interval for the background identity sync. |
+| `FX_USER_AGENT` | *(empty)* | Pin the User-Agent manually (never auto-overwritten). |
 | `PRODUCT_USER_AGENT_MODELS` | `zai/glm-5.2` | Models that get the body-level `headers.user-agent`. `*` = all, empty = none, else comma-separated. |
 | `GATEWAY_SESSION_ID` | *(empty)* | Optional session pinning header. |
 | `GATEWAY_SESSION_AFFINITY` | *(empty)* | Optional session affinity header. |
-| `RELOAD` | *(unset)* | Enable uvicorn reload when set. |
+
+### Remote images & usage tracking
+
+| Variable | Default | Description |
+|---|---|---|
+| `IMAGE_FETCH` | `1` | Download remote `http(s)` image URLs into data URLs before conversion (fx parity). |
+| `IMAGE_FETCH_TIMEOUT` | `10` | Timeout for image downloads (s). |
+| `IMAGE_FETCH_MAX_BYTES` | `5242880` | Max image size in bytes (5 MiB). |
+| `USAGE_TRACKING` | `1` | In-memory per-caller request/error/token counters. |
 
 > **Security:** `.env` is gitignored. Never commit `AI_GATEWAY_API_KEY` or
 > `PROXY_API_KEY`.
 
+---
+
+## Docker
+
+Build and run from either the repo root or the `gateway-proxy/` directory:
+
+```bash
+# From the repo root
+cp gateway-proxy/.env.example gateway-proxy/.env   # set keys first
+docker compose up --build -d
+
+# Or from gateway-proxy/
+cd gateway-proxy
+cp .env.example .env
+docker compose up --build -d
+```
+
+The container listens on `${PORT:-8787}` and reuses your `.env` via `env_file`.
+A healthcheck hits `/healthz` every 30 seconds.
 
 ---
 
@@ -223,7 +275,11 @@ All configuration is via environment variables (loaded from `.env`). See
 ```
 vercela/
 ├── CLAUDE.md                          # Guidance for AI coding agents
+├── AGENTS.md                          # Contributor guidelines
 ├── README.md                          # This file
+├── Dockerfile                         # Root-level Docker build
+├── docker-compose.yml                 # Root-level compose
+├── .dockerignore
 ├── .gitignore
 ├── docs/
 │   └── superpowers/
@@ -238,6 +294,9 @@ vercela/
     ├── .env.example                   # Config template
     ├── main.py                        # Entrypoint stub (delegates to server)
     ├── server.py                      # FastAPI app + HTTP transport layer
+    ├── identity.py                    # Live fx identity sync from GitHub
+    ├── keys.py                        # Multi-key pool (round-robin + failover)
+    ├── usage.py                       # In-memory usage tracking
     ├── test_proxy.py                  # Live smoke test (NOT a pytest)
     ├── converter/                     # Pure OpenAI ↔ v3 conversion package
     │   ├── __init__.py                #   re-exports public API
@@ -248,18 +307,22 @@ vercela/
     │   ├── streaming.py               #   v3 SSE → OpenAI SSE (live + offline)
     │   ├── responses.py               #   Responses API translation
     │   └── validation.py              #   client-side tool-history validation
-    └── tests/                         # pytest unit tests
+    └── tests/                         # pytest unit tests (190 tests)
         ├── test_cli.py
+        ├── test_identity.py
+        ├── test_keys.py
         ├── test_parts.py
         ├── test_request.py
         ├── test_response.py
         ├── test_responses.py
         ├── test_server.py
         ├── test_server_headers.py
+        ├── test_server_images.py
         ├── test_streaming.py
+        ├── test_streaming_tools.py
+        ├── test_usage.py
         └── test_validation.py
 ```
-
 
 ---
 
@@ -288,27 +351,29 @@ context manager. Routes translate requests via the `converter` package, forward
 upstream, and translate responses back. Also handles auth, request logging,
 upstream error normalization, and client-disconnect cancellation.
 
-### `main.py` — entrypoint stub
+### Supporting modules
 
-A 6-line stub that delegates to `server.app` / `server.main`, so both
-`uv run server.py` and `uv run main.py` work.
+| Module | Responsibility |
+|---|---|
+| `identity.py` | Background loop syncing fx identity (User-Agent + protocol header versions) from the vercel-labs/fx GitHub repo. Hot-swaps `identity.state` in memory. Falls back to local `fx` binary version, then hardcoded default. |
+| `keys.py` | `KeyPool`: multi-key round-robin + failover + cooldown for upstream gateway keys. Thread-safe. |
+| `usage.py` | `UsageTracker`: in-memory per-caller request/error/token counters. Thread-safe. |
+| `main.py` | 7-line entrypoint stub delegating to `server.app`. |
 
 ### Features beyond plain forwarding
 
-- **Client-side tool-history validation** — clear `400` errors instead of
-  opaque "Invalid input" gateway rejections
-- **Upstream error normalization** — gateway errors are reshaped to the
-  OpenAI error format
-- **Client-disconnect handling** — the upstream stream is cancelled when the
-  client disconnects
-- **Usage reporting** — optional usage on the final streaming chunk
-  (cache-read & reasoning-token details included)
+- **Multi-key pool** — round-robin rotation, automatic failover on 401/402/403/408/429/5xx, and cooldown for dead keys
+- **Live fx identity sync** — User-Agent and protocol headers auto-updated from the vercel-labs/fx GitHub repo
+- **Client-side tool-history validation** — clear `400` errors instead of opaque "Invalid input" gateway rejections
+- **Upstream error normalization** — gateway errors are reshaped to the OpenAI error format
+- **Client-disconnect handling** — the upstream stream is cancelled when the client disconnects
+- **Usage tracking** — per-caller request/error/token counters at `/v1/usage` and `/healthz`
+- **Usage on all routes** — token usage tracked for chat completions, responses, and embeddings (streaming and non-streaming)
 - **Reasoning streaming** — `reasoning-delta` → OpenAI `reasoning_content`
-- **Image support** — data-URL images become v3 `file` parts (fx wire format)
+- **Image support** — data-URL images become v3 `file` parts; remote `http(s)` images are fetched and inlined (fx parity)
 - **Session pinning** — `x-session-id` / `x-session-affinity` forwarded
 - **Model-list caching** — configurable TTL on `/v1/models`
 - **Configurable timeouts & HTTP/2**
-
 
 ---
 
@@ -341,20 +406,21 @@ A 6-line stub that delegates to `server.app` / `server.main`, so both
 
 ### Unit tests (pytest)
 
-The `converter/` package is fully unit-tested with a mocked upstream gateway
-(deterministic `httpx.MockTransport`, no real network traffic):
+The `converter/` package and server are fully unit-tested with a mocked upstream
+gateway (deterministic `httpx.MockTransport`, no real network traffic):
 
 ```bash
 cd gateway-proxy
-uv run pytest tests/                       # full suite
+uv run pytest tests/                       # full suite (190 tests)
 uv run pytest tests/test_request.py -v     # single file
 uv run pytest tests/test_streaming.py -k "reasoning"   # filtered
 ```
 
-Test files mirror the package layout (135 tests across 9 files):
-`test_cli.py`, `test_parts.py`, `test_request.py`, `test_response.py`,
-`test_responses.py`, `test_server.py`, `test_server_headers.py`,
-`test_streaming.py`, `test_validation.py`.
+Test files mirror the package layout (190 tests across 14 files):
+`test_cli.py`, `test_identity.py`, `test_keys.py`, `test_parts.py`,
+`test_request.py`, `test_response.py`, `test_responses.py`, `test_server.py`,
+`test_server_headers.py`, `test_server_images.py`, `test_streaming.py`,
+`test_streaming_tools.py`, `test_usage.py`, `test_validation.py`.
 
 ### Live smoke test
 
@@ -367,7 +433,6 @@ PROXY_API_KEY=your_key python test_proxy.py
 ```
 
 Do **not** run it through pytest.
-
 
 ---
 
@@ -396,8 +461,6 @@ uv run python -m converter events.json --stream   # convert v3 SSE events to Ope
 - Commit messages follow repo history: `feat:`, `fix:`, `docs:`, `refactor:`
   prefixes, lowercase subject.
 - Never commit `.env` or any API key value.
-- `baicode_install.sh` at the repo root (if present) is an unrelated
-  third-party installer — do not modify it.
 
 ---
 
@@ -408,6 +471,7 @@ uv run python -m converter events.json --stream   # convert v3 SSE events to Ope
 | [`gateway-proxy/README.md`](gateway-proxy/README.md) | Sub-project quick-start & setup |
 | [`gateway-proxy/SAUCE.md`](gateway-proxy/SAUCE.md) | Full reverse-engineering writeup — how the v3 protocol was discovered, required vs. optional fields, 503/400 failure modes, request flow diagram |
 | [`CLAUDE.md`](CLAUDE.md) | Guidance for AI coding agents working in this repo |
+| [`AGENTS.md`](AGENTS.md) | Contributor guidelines |
 | [`docs/superpowers/specs/`](docs/superpowers/specs/) | Design specs |
 | [`docs/superpowers/plans/`](docs/superpowers/plans/) | Implementation plans |
 
@@ -423,4 +487,3 @@ CLI uses.
 The free model access (`zai/glm-5.2` without a credit card) is a feature of the
 Vercel AI Gateway's v3 protocol, not a hack. The proxy just makes it accessible
 from OpenAI-compatible tools.
-
