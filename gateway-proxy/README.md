@@ -187,6 +187,28 @@ arrays), content blocks (`text`, `image`, `tool_use`, `tool_result`), tools
 with `input_schema`, `tool_choice` (`auto`/`any`/`tool`), `max_tokens`,
 `temperature`, `top_p`, `top_k`, `stop_sequences`, and streaming.
 
+### Reasoning / thinking
+
+The proxy supports reasoning/thinking end-to-end across all three API surfaces:
+
+- **OpenAI chat completions** (`/v1/chat/completions`): send `reasoning_effort`
+  (`"low"`, `"medium"`, `"high"`, etc.) or `reasoning` in the request body. The
+  value is forwarded to the upstream v3 body as the `reasoning` string label.
+  Reasoning output is returned as `reasoning_content` in delta chunks (streaming)
+  or in the message `reasoning_content` field (non-streaming).
+- **Anthropic Messages** (`/v1/messages`): send `thinking: {"type": "enabled",
+  "budget_tokens": N}` in the request. The proxy routes this as `reasoning:
+  "enabled"` upstream. Reasoning output is translated into Anthropic
+  `thinking` content blocks (separate from `text` blocks) in both streaming and
+  non-streaming responses — matching the sequential content block protocol where
+  a thinking block is closed before a text or tool block starts.
+- **Responses API** (`/v1/responses`): `reasoning` summaries are included as
+  reasoning content parts in the response.
+
+Regardless of the client-side reasoning level or label, the proxy always
+forwards the reasoning field upstream so the model uses its highest available
+reasoning level.
+
 ### List models
 
 ```bash
@@ -277,7 +299,7 @@ A healthcheck hits `/healthz` every 30 seconds.
 ## Testing
 
 ```bash
-uv run pytest tests/                       # full suite (235 tests)
+uv run pytest tests/                       # full suite (266 tests)
 uv run pytest tests/test_anthropic.py -v   # Anthropic converter
 uv run pytest tests/test_keys.py -v        # key pool + round-robin + failover
 uv run pytest tests/test_streaming.py -v   # streaming conversion

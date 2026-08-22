@@ -12,7 +12,7 @@ gateway-proxy/
 │   ├── response.py      #   v3_to_openai() — non-streaming response
 │   ├── streaming.py     #   v3 SSE → OpenAI SSE (live + offline)
 │   ├── responses.py     #   Responses API translation
-│   ├── anthropic.py    #   Anthropic Messages API ↔ OpenAI translation
+│   ├── anthropic.py     #   Anthropic Messages API ↔ OpenAI translation
 │   └── validation.py    #   tool-history pairing checks
 ├── server.py           # FastAPI app + HTTP transport (routes, auth, key pool)
 ├── identity.py         # Background fx identity sync from GitHub
@@ -47,7 +47,7 @@ uv run python -m converter body.json       # CLI: convert OpenAI request to v3
 
 - Framework: `pytest` with `httpx.MockTransport` (no real network traffic).
 - Test files mirror source: `tests/test_request.py` ↔ `converter/request.py`.
-- 135+ tests across 12 files. Run the full suite before submitting changes.
+- 266 tests across 15 files. Run the full suite before submitting changes.
 - `test_proxy.py` is a **live smoke test** — do not run it through pytest. It requires the proxy running on port 8799.
 - When adding a converter parameter, add a test asserting the field appears in the v3 body.
 

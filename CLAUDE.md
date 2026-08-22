@@ -23,7 +23,7 @@ For day-to-day run/test setup see `gateway-proxy/README.md`; this file documents
 
 ## Layer split (preserve it)
 
-- **`converter/` package** — pure functions, no I/O. OpenAI ↔ AI SDK v3 translation + `validate_tool_history()`. Modules: `request.py` (`openai_to_v3`), `parts.py` (content/tool-call part shapes), `streaming.py` (v3 SSE → OpenAI chunks), `response.py` (non-streaming aggregation), `responses.py` (Responses API shim), `anthropic.py` (Anthropic Messages API ↔ OpenAI translation), `validation.py`. Add request/response-shape work here, with tests in the matching `tests/test_*.py`.
+- **`converter/` package** — pure functions, no I/O. OpenAI ↔ AI SDK v3 translation + `validate_tool_history()`. Modules: `request.py` (`openai_to_v3`, includes `top_k` → `topK` mapping), `parts.py` (content/tool-call part shapes), `streaming.py` (v3 SSE → OpenAI chunks, collects `reasoning-delta` events into `reasoning_content`), `response.py` (non-streaming aggregation, surfaces `reasoning_content`), `responses.py` (Responses API shim), `anthropic.py` (Anthropic Messages API ↔ OpenAI translation, `thinking` config routing, `thinking` content blocks), `validation.py`. Add request/response-shape work here, with tests in the matching `tests/test_*.py`.
 - **`server.py`** — FastAPI + HTTP transport (shared `httpx.AsyncClient` in `lifespan`, HTTP/2 on). Routes, auth, key pooling, upstream send. Add routes or transport changes here.
 - **`identity.py`** — background loop syncing the fx identity (User-Agent + protocol/spec header versions) from the vercel-labs/fx GitHub repo into `identity.state`, hot-swapped in memory. Read on every request by `_v3_headers()` and `openai_to_v3()`. `FX_AUTO_UPDATE=0` disables; `FX_USER_AGENT=fx/x.y.z` pins manually.
 - **`keys.py`** — `KeyPool`: multi-key round-robin + failover + cooldown for upstream gateway keys (`AI_GATEWAY_API_KEY`, `AI_GATEWAY_API_KEY_1..20`). Used via `_upstream_pooled()` in `server.py`.
@@ -38,6 +38,28 @@ All client formats funnel through one converter: every request reaches `converte
 - **Response side:** the upstream v3 SSE stream is always translated to OpenAI chunks first (`streaming.v3_stream_iter` / non-streaming `v3_sse_stream_to_openai`). `/v1/messages` then re-translates those OpenAI chunks into Anthropic SSE (`anthropic_stream_iter`); `/v1/responses` re-translates into Responses SSE (`openai_chunk_to_responses_sse`). Two-stage on the way out mirrors two-stage on the way in.
 - The Anthropic route reuses the OpenAI pipeline end-to-end via `_send_to_v3()`; the chat and responses routes inline the same hydrate → `openai_to_v3` → `_upstream_pooled` sequence.
 - `validate_tool_history()` runs on the OpenAI-shaped messages for **all three** routes (after the `→openai` step for Anthropic/Responses).
+
+## Reasoning / thinking pipeline
+
+Reasoning flows through all three API surfaces and is translated at each boundary:
+
+- **Request side (client → upstream):** `reasoning_effort` and `reasoning` in
+  OpenAI requests are forwarded as the `reasoning` string label in the v3 body.
+  Anthropic `thinking: {"type": "enabled"}` is routed to `reasoning: "enabled"`
+  in `anthropic_to_openai()`; explicit `reasoning`/`reasoning_effort` takes
+  precedence. `auto` or omitted → the `reasoning` field is omitted entirely
+  (matching the fx CLI behavior).
+- **Streaming response (upstream → client):** the v3 SSE stream emits
+  `reasoning-start` / `reasoning-delta` / `reasoning-end` events.
+  `v3_sse_stream_to_openai()` collects these into `reasoning_content` on the
+  message dict. For Anthropic clients, `_AnthropicStreamState.thinking_delta()`
+  emits `thinking` content blocks via `thinking_delta` SSE events.
+- **Non-streaming response:** `reasoning_content` is surfaced as a
+  `thinking` content block in `openai_to_anthropic()`.
+- **Content block ordering (Anthropic):** thinking blocks are sequential, not
+  interleaved. `text_delta()` and `tool_call()` close any open thinking block
+  before starting a new text or tool block. `finish()` closes any remaining
+  open block.
 
 ## Protocol invariants (load-bearing)
 
