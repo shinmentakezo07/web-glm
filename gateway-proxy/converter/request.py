@@ -118,6 +118,8 @@ def openai_to_v3(
         v3_body["maxOutputTokens"] = body["maxOutputTokens"]
     if "top_p" in body:
         v3_body["topP"] = body["top_p"]
+    if "top_k" in body:
+        v3_body["topK"] = body["top_k"]
     if "stop" in body:
         v3_body["stopSequences"] = body["stop"] if isinstance(body["stop"], list) else [body["stop"]]
 

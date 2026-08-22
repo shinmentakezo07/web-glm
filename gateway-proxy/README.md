@@ -126,6 +126,67 @@ export OPENAI_API_BASE=http://localhost:8787/v1
 export OPENAI_API_KEY=your_proxy_key_here
 ```
 
+### Anthropic-compatible clients (Claude Code, Anthropic SDK)
+
+The proxy also exposes the Anthropic Messages API at `/v1/messages`, so
+Claude Code, the Anthropic Python/TS SDKs, and any Anthropic-compatible
+client can use it directly.
+
+**Claude Code:**
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:8787
+export ANTHROPIC_API_KEY=your_proxy_key_here
+```
+
+**Anthropic Python SDK:**
+
+```python
+import anthropic
+
+client = anthropic.Anthropic(
+    base_url="http://localhost:8787",
+    api_key="your_proxy_key_here",
+)
+message = client.messages.create(
+    model="zai/glm-5.2",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+print(message.content[0].text)
+```
+
+**curl:**
+
+```bash
+# Non-streaming
+curl http://localhost:8787/v1/messages \
+  -H "x-api-key: your_proxy_key_here" \
+  -H "content-type: application/json" \
+  -d '{
+    "model": "zai/glm-5.2",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+
+# Streaming
+curl -N http://localhost:8787/v1/messages \
+  -H "x-api-key: your_proxy_key_here" \
+  -H "content-type: application/json" \
+  -d '{
+    "model": "zai/glm-5.2",
+    "max_tokens": 1024,
+    "stream": true,
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+```
+
+The Anthropic route accepts `x-api-key` or `Authorization: Bearer` auth, and
+supports all major Messages API features: `system` prompts (string or block
+arrays), content blocks (`text`, `image`, `tool_use`, `tool_result`), tools
+with `input_schema`, `tool_choice` (`auto`/`any`/`tool`), `max_tokens`,
+`temperature`, `top_p`, `top_k`, `stop_sequences`, and streaming.
+
 ### List models
 
 ```bash
@@ -146,6 +207,8 @@ curl http://localhost:8787/v1/usage \
 |---|---|---|
 | `/v1/chat/completions` | POST | Chat completions (OpenAI format) |
 | `/v1/responses` | POST | OpenAI Responses API (input items → v3) |
+| `/v1/messages` | POST | Anthropic Messages API (Claude Code / Anthropic SDK) |
+| `/v1/messages/count_tokens` | POST | Anthropic token counting |
 | `/v1/models` | GET | List available models (cached) |
 | `/v1/embeddings` | POST | Embeddings (uses v1 endpoint) |
 | `/v1/usage` | GET | Per-caller usage counters since process start |
@@ -205,7 +268,8 @@ A healthcheck hits `/healthz` every 30 seconds.
 - **Usage tracking** (`USAGE_TRACKING=1`, default on): request/error/token
   counters per calling client, exposed at `GET /v1/usage` and summarised in
   `/healthz`. In-memory only; resets on restart. Tracked on all routes
-  (chat completions, responses, and embeddings — streaming and non-streaming).
+  (chat completions, responses, Anthropic messages, and embeddings —
+  streaming and non-streaming).
 - **Identity fallback**: if the GitHub fx sync is disabled or unreachable,
   the proxy uses the version of any locally installed `fx` binary before
   falling back to the hardcoded default User-Agent.
@@ -213,7 +277,8 @@ A healthcheck hits `/healthz` every 30 seconds.
 ## Testing
 
 ```bash
-uv run pytest tests/                       # full suite (190 tests)
+uv run pytest tests/                       # full suite (235 tests)
+uv run pytest tests/test_anthropic.py -v   # Anthropic converter
 uv run pytest tests/test_keys.py -v        # key pool + round-robin + failover
 uv run pytest tests/test_streaming.py -v   # streaming conversion
 ```

@@ -23,11 +23,21 @@ For day-to-day run/test setup see `gateway-proxy/README.md`; this file documents
 
 ## Layer split (preserve it)
 
-- **`converter/` package** — pure functions, no I/O. OpenAI ↔ AI SDK v3 translation + `validate_tool_history()`. Modules: `request.py` (`openai_to_v3`), `parts.py` (content/tool-call part shapes), `streaming.py` (v3 SSE → OpenAI chunks), `response.py` (non-streaming aggregation), `responses.py` (Responses API shim), `validation.py`. Add request/response-shape work here, with tests in the matching `tests/test_*.py`.
+- **`converter/` package** — pure functions, no I/O. OpenAI ↔ AI SDK v3 translation + `validate_tool_history()`. Modules: `request.py` (`openai_to_v3`), `parts.py` (content/tool-call part shapes), `streaming.py` (v3 SSE → OpenAI chunks), `response.py` (non-streaming aggregation), `responses.py` (Responses API shim), `anthropic.py` (Anthropic Messages API ↔ OpenAI translation), `validation.py`. Add request/response-shape work here, with tests in the matching `tests/test_*.py`.
 - **`server.py`** — FastAPI + HTTP transport (shared `httpx.AsyncClient` in `lifespan`, HTTP/2 on). Routes, auth, key pooling, upstream send. Add routes or transport changes here.
 - **`identity.py`** — background loop syncing the fx identity (User-Agent + protocol/spec header versions) from the vercel-labs/fx GitHub repo into `identity.state`, hot-swapped in memory. Read on every request by `_v3_headers()` and `openai_to_v3()`. `FX_AUTO_UPDATE=0` disables; `FX_USER_AGENT=fx/x.y.z` pins manually.
 - **`keys.py`** — `KeyPool`: multi-key round-robin + failover + cooldown for upstream gateway keys (`AI_GATEWAY_API_KEY`, `AI_GATEWAY_API_KEY_1..20`). Used via `_upstream_pooled()` in `server.py`.
+- **`usage.py`** — `UsageTracker`: in-memory per-caller request/error/token counters (thread-safe, reset on restart), fed by `_tracked_stream()` and direct `USAGE.record()` calls on every route; exposed at `/v1/usage` and summarized in `/healthz`.
 - **`main.py`** is a 7-line stub that delegates to `server.app` / `server.main` so both `uv run server.py` and `uv run main.py` work — don't duplicate the entrypoint.
+
+## Translation flow (v3 is the canonical shape)
+
+All client formats funnel through one converter: every request reaches `converter.openai_to_v3()` before going upstream, and every response/stream is produced from an OpenAI chat-completion as the intermediate shape.
+
+- **Request side:** `/v1/chat/completions` calls `openai_to_v3()` directly. `/v1/responses` first runs `responses_input_to_messages()`, and `/v1/messages` first runs `anthropic_to_openai()` — both produce an OpenAI chat body, then hand it to the same `openai_to_v3()`. A new client format is a new `→openai` converter, not a new v3 path.
+- **Response side:** the upstream v3 SSE stream is always translated to OpenAI chunks first (`streaming.v3_stream_iter` / non-streaming `v3_sse_stream_to_openai`). `/v1/messages` then re-translates those OpenAI chunks into Anthropic SSE (`anthropic_stream_iter`); `/v1/responses` re-translates into Responses SSE (`openai_chunk_to_responses_sse`). Two-stage on the way out mirrors two-stage on the way in.
+- The Anthropic route reuses the OpenAI pipeline end-to-end via `_send_to_v3()`; the chat and responses routes inline the same hydrate → `openai_to_v3` → `_upstream_pooled` sequence.
+- `validate_tool_history()` runs on the OpenAI-shaped messages for **all three** routes (after the `→openai` step for Anthropic/Responses).
 
 ## Protocol invariants (load-bearing)
 

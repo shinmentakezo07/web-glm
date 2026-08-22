@@ -31,6 +31,14 @@ from .responses import (
     responses_input_to_messages,
     v3_stream_to_responses_sse,
 )
+from .anthropic import (
+    _AnthropicStreamState,
+    anthropic_stream_iter,
+    anthropic_to_openai,
+    count_anthropic_tokens,
+    openai_chunk_to_anthropic_sse,
+    openai_to_anthropic,
+)
 
 __all__ = [
     "_image_url_to_v3_part", "_normalize_tool_choice", "_openai_content_to_v3_parts",
@@ -42,4 +50,7 @@ __all__ = [
     "_ResponsesStreamState", "openai_chunk_to_responses_sse",
     "openai_to_responses", "responses_input_to_messages",
     "v3_stream_to_responses_sse",
+    "_AnthropicStreamState", "anthropic_stream_iter",
+    "anthropic_to_openai", "count_anthropic_tokens",
+    "openai_chunk_to_anthropic_sse", "openai_to_anthropic",
 ]

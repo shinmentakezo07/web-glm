@@ -71,6 +71,12 @@ from converter.responses import (
     openai_chunk_to_responses_sse,
     _ResponsesStreamState,
 )
+from converter.anthropic import (
+    anthropic_to_openai,
+    openai_to_anthropic,
+    anthropic_stream_iter,
+    count_anthropic_tokens,
+)
 
 import identity
 from keys import KeyPool, load_keys, mask
@@ -173,6 +179,37 @@ app = FastAPI(title="fx-style AI Gateway proxy", lifespan=lifespan)
 
 
 # --------------------------------------------------------------------------- #
+# Anthropic error handling
+# --------------------------------------------------------------------------- #
+
+
+class AnthropicError(Exception):
+    """Exception that renders as the Anthropic error JSON shape.
+
+    Raised by Anthropic-route auth/validation so error bodies match what
+    Claude Code and the Anthropic SDKs expect:
+    ``{"type": "error", "error": {"type": ..., "message": ...}}``
+    """
+
+    def __init__(self, message: str, error_type: str = "api_error", status: int = 400):
+        self.message = message
+        self.error_type = error_type
+        self.status = status
+        super().__init__(message)
+
+
+@app.exception_handler(AnthropicError)
+async def _anthropic_error_handler(request: Request, exc: AnthropicError):
+    return JSONResponse(
+        status_code=exc.status,
+        content={
+            "type": "error",
+            "error": {"type": exc.error_type, "message": exc.message},
+        },
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Request logging middleware
 # --------------------------------------------------------------------------- #
 
@@ -206,6 +243,30 @@ def verify_proxy_key(
     if not secrets.compare_digest(creds.credentials.encode(), PROXY_API_KEY.encode()):
         raise HTTPException(status_code=401, detail="Invalid API key")
     return creds.credentials
+
+
+def verify_anthropic_key(request: Request) -> str:
+    """Auth for Anthropic-style requests: x-api-key header or Bearer token.
+
+    Claude Code and the Anthropic SDKs send ``x-api-key: <key>``. We also
+    accept ``Authorization: Bearer <key>`` so non-Anthropic clients work too.
+    When no PROXY_API_KEY is set, the proxy is open (same as OpenAI routes).
+
+    Raises ``AnthropicError`` (not ``HTTPException``) so the response body
+    matches the Anthropic error shape ``{"type": "error", "error": {...}}``.
+    """
+    if not PROXY_API_KEY:
+        return "anonymous"
+    api_key = request.headers.get("x-api-key", "")
+    if not api_key:
+        auth = request.headers.get("authorization", "")
+        if auth.lower().startswith("bearer "):
+            api_key = auth[7:]
+    if not api_key:
+        raise AnthropicError("Missing API key", "authentication_error", 401)
+    if not secrets.compare_digest(api_key.encode(), PROXY_API_KEY.encode()):
+        raise AnthropicError("Invalid API key", "authentication_error", 401)
+    return api_key
 
 
 def _get_client() -> httpx.AsyncClient:
@@ -511,6 +572,57 @@ async def _collect_response(resp: httpx.Response, model: str) -> dict:
     return v3_sse_stream_to_openai(iter(events), model)
 
 
+async def _anthropic_stream(resp: httpx.Response, model: str) -> AsyncIterator[str]:
+    """Consume the upstream v3 stream and yield Anthropic Messages SSE events.
+
+    The upstream v3 stream is first translated to OpenAI chunks (reusing
+    ``_chat_stream``), then those chunks are translated to Anthropic SSE
+    events by ``anthropic_stream_iter``.
+    """
+    try:
+        async for chunk in anthropic_stream_iter(
+            _chat_stream(resp, model, include_usage=True), model
+        ):
+            yield chunk
+    finally:
+        pass  # _chat_stream closes resp in its own finally
+
+
+async def _send_to_v3(
+    client: httpx.AsyncClient,
+    request: Request,
+    chat_body: dict,
+    model: str,
+) -> tuple[httpx.Response, str]:
+    """Shared upstream-send: hydrate images, build v3 body, pooled send.
+
+    Returns (upstream_response, used_key). Caller is responsible for closing
+    the response when stream=True (via the stream generator) or after
+    collecting.
+    """
+    await _hydrate_remote_images(client, chat_body)
+    v3_body = openai_to_v3(
+        chat_body,
+        product_user_agent=identity.state["user_agent"],
+        product_user_agent_models=PRODUCT_USER_AGENT_MODELS,
+    )
+    url = urljoin(GATEWAY_BASE_URL + "/", GATEWAY_V3_CHAT.lstrip("/"))
+    session_id = request.headers.get("x-session-id") or GATEWAY_SESSION_ID
+    session_affinity = request.headers.get("x-session-affinity") or GATEWAY_SESSION_AFFINITY
+
+    async def send(key: str) -> httpx.Response:
+        headers = _v3_headers(
+            model,
+            streaming=True,
+            api_key=key,
+            session_id=session_id,
+            session_affinity=session_affinity,
+        )
+        return await _send_upstream(client, url, headers, v3_body)
+
+    return await _upstream_pooled(send)
+
+
 # --------------------------------------------------------------------------- #
 # Routes
 # --------------------------------------------------------------------------- #
@@ -768,6 +880,128 @@ async def embeddings(request: Request, _: str = Depends(verify_proxy_key)):
         completion_tokens=_int_tokens(_u.get("completion_tokens")),
     )
     return JSONResponse(content=data)
+
+
+# --------------------------------------------------------------------------- #
+# Anthropic Messages API (/v1/messages)
+# --------------------------------------------------------------------------- #
+
+
+def _anthropic_error(resp: httpx.Response) -> JSONResponse:
+    """Normalize an upstream error into the Anthropic error shape."""
+    try:
+        body = resp.json()
+    except Exception:
+        body = None
+    message = None
+    if isinstance(body, dict) and "error" in body:
+        err = body["error"]
+        message = err.get("message") if isinstance(err, dict) else str(err)
+    elif isinstance(body, dict):
+        message = body.get("message") or json.dumps(body)[:2000]
+    if not message:
+        message = (resp.text or f"upstream error (HTTP {resp.status_code})")[:2000]
+    status = resp.status_code if resp.status_code >= 400 else 500
+    err_type = "invalid_request_error" if status == 400 else "api_error"
+    return JSONResponse(
+        status_code=status,
+        content={
+            "type": "error",
+            "error": {"type": err_type, "message": message},
+        },
+    )
+
+
+def _anthropic_invalid_request(message: str, status: int = 400) -> JSONResponse:
+    return JSONResponse(
+        status_code=status,
+        content={
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": message},
+        },
+    )
+
+
+@app.post("/v1/messages")
+async def anthropic_messages(request: Request, _: str = Depends(verify_anthropic_key)):
+    """Proxy the Anthropic Messages API via the v3 AI SDK endpoint.
+
+    Translates Anthropic Messages requests -> OpenAI -> v3, forwards to the
+    gateway, and translates the response back to the Anthropic Message shape.
+    Supports streaming (SSE) and non-streaming, tools, images, and system
+    prompts.
+    """
+    client = _get_client()
+
+    body = await _parse_body(request)
+    if not body:
+        return _anthropic_invalid_request("Invalid JSON body")
+
+    model = body.get("model") or DEFAULT_MODEL
+    if not isinstance(model, str) or not model:
+        return _anthropic_invalid_request("model is required")
+
+    if "max_tokens" not in body:
+        return _anthropic_invalid_request("max_tokens is required")
+
+    # Convert Anthropic request -> OpenAI chat-completions body.
+    oai_body = anthropic_to_openai(body)
+
+    # Validate tool history (now in OpenAI shape).
+    err = validate_tool_history(oai_body.get("messages", []))
+    if err:
+        log.warning("rejected /v1/messages request: %s", err)
+        return _anthropic_invalid_request(f"Invalid messages: {err}")
+
+    _warn_dropped_params(oai_body)
+
+    stream = bool(body.get("stream", False))
+
+    resp, used_key = await _send_to_v3(client, request, oai_body, model)
+    log.debug("POST /v1/messages via gateway key %s", mask(used_key))
+
+    caller = request.client.host if request.client else "unknown"
+    if resp.status_code != 200:
+        USAGE.record(caller, model=model, error=True)
+        err_resp = _anthropic_error(resp)
+        await resp.aclose()
+        return err_resp
+
+    if stream:
+        return StreamingResponse(
+            _tracked_stream(_anthropic_stream(resp, model), caller, model),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    try:
+        result = await _collect_response(resp, model)
+    finally:
+        await resp.aclose()
+    _u = result.get("usage") or {}
+    USAGE.record(
+        caller,
+        model=model,
+        prompt_tokens=_int_tokens(_u.get("prompt_tokens")),
+        completion_tokens=_int_tokens(_u.get("completion_tokens")),
+    )
+    return JSONResponse(content=openai_to_anthropic(result, model))
+
+
+@app.post("/v1/messages/count_tokens")
+async def anthropic_count_tokens(
+    request: Request, _: str = Depends(verify_anthropic_key)
+):
+    """Estimate token count for an Anthropic Messages API request.
+
+    Uses a character-based heuristic (no tokenizer dependency). Returns the
+    same ``{input_tokens}`` shape the Anthropic API does.
+    """
+    body = await _parse_body(request)
+    if not body:
+        return _anthropic_invalid_request("Invalid JSON body")
+    token_count = count_anthropic_tokens(body)
+    return JSONResponse(content={"input_tokens": token_count})
 
 
 # --------------------------------------------------------------------------- #

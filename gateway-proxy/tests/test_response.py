@@ -117,3 +117,27 @@ class TestUsageDetails:
     def test_flat_input_output_tokens(self):
         usage = _v3_usage_to_openai({"inputTokens": 7, "outputTokens": 3})
         assert usage == {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+
+
+class TestV3ToOpenAIReasoning:
+    def test_reasoning_content_part_collected(self):
+        v3 = {
+            "content": [
+                {"type": "reasoning", "text": "I thought about this"},
+                {"type": "text", "text": "the answer"},
+            ],
+            "finishReason": "stop",
+        }
+        result = v3_to_openai(v3, model="m")
+        msg = result["choices"][0]["message"]
+        assert msg["content"] == "the answer"
+
+    def test_choices_shape_with_usage_and_reasoning_tokens(self):
+        v3 = {
+            "content": [{"type": "text", "text": "hi"}],
+            "finishReason": "stop",
+            "usage": {"inputTokens": {"total": 10}, "outputTokens": {"total": 20, "reasoning": 5}},
+        }
+        result = v3_to_openai(v3, model="m")
+        assert result["usage"]["output_tokens_details"] == {"reasoning_tokens": 5}
+        assert result["usage"]["completion_tokens"] == 20

@@ -271,3 +271,91 @@ class TestStreamingNewEvents:
         ]
         result = v3_sse_stream_to_openai(iter(events), model="m")
         assert result["usage"] == {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
+
+    def test_non_stream_collector_collects_reasoning(self):
+        events = [
+            {"type": "reasoning-delta", "delta": "let me think"},
+            {"type": "reasoning-delta", "delta": " harder"},
+            {"type": "text-delta", "delta": "answer"},
+            {"type": "finish", "finishReason": "stop"},
+        ]
+        result = v3_sse_stream_to_openai(iter(events), model="m")
+        msg = result["choices"][0]["message"]
+        assert msg["reasoning_content"] == "let me think harder"
+        assert msg["content"] == "answer"
+
+    def test_non_stream_collector_no_reasoning_omits_field(self):
+        events = [
+            {"type": "text-delta", "delta": "answer"},
+            {"type": "finish", "finishReason": "stop"},
+        ]
+        result = v3_sse_stream_to_openai(iter(events), model="m")
+        assert "reasoning_content" not in result["choices"][0]["message"]
+
+    def test_non_stream_collector_reasoning_with_tools(self):
+        events = [
+            {"type": "reasoning-delta", "delta": "thinking about tools"},
+            {"type": "tool-call", "toolCallId": "call_1", "toolName": "calc", "input": {"x": 1}},
+            {"type": "finish", "finishReason": "tool-calls",
+             "usage": {"inputTokens": {"total": 5}, "outputTokens": {"total": 3}}},
+        ]
+        result = v3_sse_stream_to_openai(iter(events), model="m")
+        msg = result["choices"][0]["message"]
+        assert msg["reasoning_content"] == "thinking about tools"
+        assert msg["content"] is None
+        assert len(msg["tool_calls"]) == 1
+        assert result["choices"][0]["finish_reason"] == "tool_calls"
+
+    def test_non_stream_collector_reasoning_with_usage(self):
+        events = [
+            {"type": "reasoning-delta", "delta": "thinking"},
+            {"type": "text-delta", "delta": "answer"},
+            {"type": "finish", "finishReason": "stop",
+             "usage": {"inputTokens": {"total": 10}, "outputTokens": {"total": 5, "reasoning": 3}}},
+        ]
+        result = v3_sse_stream_to_openai(iter(events), model="m")
+        msg = result["choices"][0]["message"]
+        assert msg["reasoning_content"] == "thinking"
+        assert msg["content"] == "answer"
+        assert result["usage"]["output_tokens_details"] == {"reasoning_tokens": 3}
+
+    def test_stream_reasoning_then_text_then_tool(self):
+        """Full stream: reasoning deltas, text deltas, tool call, finish."""
+        events = [
+            {"type": "reasoning-start", "id": "r1"},
+            {"type": "reasoning-delta", "id": "r1", "delta": "let me think"},
+            {"type": "reasoning-end", "id": "r1"},
+            {"type": "text-delta", "delta": "here is "},
+            {"type": "text-delta", "delta": "my answer"},
+            {"type": "tool-call", "toolCallId": "call_1", "toolName": "save", "input": {"result": "done"}},
+            {"type": "finish", "finishReason": "tool-calls",
+             "usage": {"inputTokens": {"total": 10}, "outputTokens": {"total": 5}}},
+        ]
+        sse = v3_stream_to_openai(events, model="gpt-4")
+        chunks = self._data_chunks(sse)
+        reasoning = [c["choices"][0]["delta"].get("reasoning_content")
+                     for c in chunks
+                     if c["choices"][0]["delta"].get("reasoning_content")]
+        assert reasoning == ["let me think"]
+        text_parts = [c["choices"][0]["delta"].get("content")
+                      for c in chunks
+                      if c["choices"][0]["delta"].get("content")]
+        assert text_parts == ["here is ", "my answer"]
+        tool_chunks = [c for c in chunks if c["choices"][0]["delta"].get("tool_calls")]
+        assert len(tool_chunks) == 1
+        assert tool_chunks[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "save"
+
+    def test_stream_reasoning_only_no_text(self):
+        events = [
+            {"type": "reasoning-delta", "delta": "just thinking"},
+            {"type": "finish", "finishReason": "stop"},
+        ]
+        sse = v3_stream_to_openai(events, model="gpt-4")
+        chunks = self._data_chunks(sse)
+        reasoning = [c["choices"][0]["delta"].get("reasoning_content")
+                     for c in chunks
+                     if c["choices"][0]["delta"].get("reasoning_content")]
+        assert reasoning == ["just thinking"]
+        # no text content chunks
+        text = [c for c in chunks if c["choices"][0]["delta"].get("content")]
+        assert text == []
