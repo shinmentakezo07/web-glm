@@ -11,3 +11,6 @@ wheels/
 
 # Secrets / local config
 .env
+
+# runtime proxy log
+proxy.log

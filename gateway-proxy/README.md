@@ -61,6 +61,28 @@ AI_GATEWAY_API_KEY=vck_your_key_here
 PROXY_API_KEY=your_proxy_key_here
 ```
 
+### Multiple gateway keys (round-robin + failover)
+
+The proxy supports several upstream gateway keys. List them in `.env`:
+
+```env
+AI_GATEWAY_API_KEY_1=vck_first_key
+AI_GATEWAY_API_KEY_2=vck_second_key
+```
+
+With more than one key configured:
+
+- **Round-robin** — requests alternate across keys (`KEY_ROTATION=1`, default on).
+- **Automatic failover** — if a key fails with `401/402/403/408/429`, any `5xx`,
+  or a network error, the request is transparently retried on the next key
+  (`KEY_FAILOVER=1`, default on). Request faults like `400` are not retried.
+- **Cooldown** — a failing key sits out of rotation for `KEY_COOLDOWN` seconds
+  (default 30, `0` disables) so a dead key stops costing latency.
+
+All three switches are plain `.env` flags — set `0` to disable. `/healthz`
+reports the pool state (`keys.count`, `rotation`, `failover`, `cooling`) and
+startup logs each key's masked tail.
+
 ## Run
 
 ```bash
@@ -118,6 +140,7 @@ curl http://localhost:8787/v1/models \
 | `/v1/models` | GET | List available models |
 | `/v1/embeddings` | POST | Embeddings (uses v1 endpoint) |
 | `/healthz` | GET | Health check |
+| `/v1/usage` | GET | Per-caller usage counters since process start |
 
 ## Key headers the proxy sends (matching fx CLI)
 
@@ -144,3 +167,26 @@ x-session-affinity: <affinity> # only sent when configured (session pinning)
 - The body-level `headers.user-agent` is only sent for `zai/glm-5.2` (mirrors the fx
   CLI); override with `PRODUCT_USER_AGENT_MODELS` (`*` = all models, empty = none).
 - `zai/glm-5.2` is confirmed to work without a credit card. Other models may require one.
+
+## Docker
+
+```bash
+cd gateway-proxy
+cp .env.example .env   # set AI_GATEWAY_API_KEY / PROXY_API_KEY first
+docker compose up --build -d
+```
+
+The container listens on `${PORT:-8787}` and reuses your `.env` via `env_file`.
+
+## Remote images & usage tracking
+
+- **Remote images** (`IMAGE_FETCH=1`, default on): `http(s)` image URLs in
+  messages are downloaded and inlined as data URLs before conversion — same
+  behaviour as fx, which fetches attachments locally. Failures leave the URL
+  unchanged; cap size with `IMAGE_FETCH_MAX_BYTES`.
+- **Usage tracking** (`USAGE_TRACKING=1`, default on): request/error/token
+  counters per calling client, exposed at `GET /v1/usage` and summarised in
+  `/healthz`. In-memory only; resets on restart.
+- **Identity fallback**: if the GitHub fx sync is disabled or unreachable,
+  the proxy uses the version of any locally installed `fx` binary before
+  falling back to the hardcoded default User-Agent.

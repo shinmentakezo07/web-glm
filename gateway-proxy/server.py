@@ -41,8 +41,11 @@ import json
 import os
 import time
 import uuid
+import asyncio
+import base64
+import secrets
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from urllib.parse import urljoin
 
@@ -69,16 +72,23 @@ from converter.responses import (
     _ResponsesStreamState,
 )
 
+import identity
+from keys import KeyPool, load_keys, mask
+from usage import UsageTracker
+
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
 
 GATEWAY_BASE_URL = os.getenv("GATEWAY_BASE_URL", "https://ai-gateway.vercel.sh")
-GATEWAY_API_KEY = os.getenv("AI_GATEWAY_API_KEY", "")
+GATEWAY_KEYS = load_keys()
+KEY_POOL = KeyPool(GATEWAY_KEYS)
+USAGE = UsageTracker(
+    enabled=os.getenv("USAGE_TRACKING", "1").lower() in ("1", "true", "yes", "on")
+)
 GATEWAY_TEAM = os.getenv("GATEWAY_TEAM", "")
 PROXY_API_KEY = os.getenv("PROXY_API_KEY", "")
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "zai/glm-5.2")
-FX_USER_AGENT = os.getenv("FX_USER_AGENT", "fx/0.0.4")
 GATEWAY_SESSION_ID = os.getenv("GATEWAY_SESSION_ID", "")
 GATEWAY_SESSION_AFFINITY = os.getenv("GATEWAY_SESSION_AFFINITY", "")
 
@@ -100,6 +110,12 @@ GATEWAY_TIMEOUT_WRITE = float(os.getenv("GATEWAY_TIMEOUT_WRITE", "60"))
 GATEWAY_TIMEOUT_POOL = float(os.getenv("GATEWAY_TIMEOUT_POOL", "60"))
 GATEWAY_HTTP2 = os.getenv("GATEWAY_HTTP2", "1").lower() in ("1", "true", "yes")
 MODELS_CACHE_TTL = float(os.getenv("MODELS_CACHE_TTL", "300"))
+
+# fx parity: download remote image_url parts into data URLs pre-conversion
+# (fx fetches/verifies attachments locally; the gateway cannot fetch URLs).
+IMAGE_FETCH = os.getenv("IMAGE_FETCH", "1").lower() in ("1", "true", "yes", "on")
+IMAGE_FETCH_TIMEOUT = float(os.getenv("IMAGE_FETCH_TIMEOUT", "10"))
+IMAGE_FETCH_MAX_BYTES = int(os.getenv("IMAGE_FETCH_MAX_BYTES", str(5 * 1024 * 1024)))
 
 GATEWAY_V3_CHAT = "/v3/ai/language-model"
 GATEWAY_V1_MODELS = "/v1/models"
@@ -129,19 +145,28 @@ def _build_client() -> httpx.AsyncClient:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Reuse a client that was injected ahead of time (e.g. by tests).
-    if getattr(app.state, "client", None) is None:
+    client_injected = getattr(app.state, "client", None) is not None
+    if not client_injected:
         app.state.client = _build_client()
     if not hasattr(app.state, "models_cache"):
         app.state.models_cache = {"data": None, "expires": 0.0}
-    client: httpx.AsyncClient = app.state.client
-    log.info("proxy ready  gateway=%s  default_model=%s  http2=%s",
-             GATEWAY_BASE_URL, DEFAULT_MODEL, GATEWAY_HTTP2)
-    if not GATEWAY_API_KEY:
-        log.warning("AI_GATEWAY_API_KEY not set — upstream will reject requests")
+    if not len(KEY_POOL):
+        log.warning("no AI_GATEWAY_API_KEY / AI_GATEWAY_API_KEY_N set — upstream will reject requests")
+    else:
+        log.info("key pool: %d key(s)  rotation=%s  failover=%s  cooldown=%.0fs",
+                 len(KEY_POOL), KEY_POOL.rotation, KEY_POOL.failover,
+                 KEY_POOL.cooldown_seconds)
+        for _k in KEY_POOL.keys:
+            log.info("  gateway key %s", mask(_k))
     if not PROXY_API_KEY:
         log.warning("PROXY_API_KEY not set — proxy is open to all callers")
+    if not client_injected:
+        app.state.identity_task = identity.start(app.state)
     yield
-    await client.aclose()
+    task: asyncio.Task | None = getattr(app.state, "identity_task", None)
+    if task is not None:
+        task.cancel()
+    await app.state.client.aclose()
 
 
 app = FastAPI(title="fx-style AI Gateway proxy", lifespan=lifespan)
@@ -178,7 +203,7 @@ def verify_proxy_key(
         return "anonymous"
     if creds is None or creds.scheme.lower() != "bearer":
         raise HTTPException(status_code=401, detail="Missing Bearer token")
-    if creds.credentials != PROXY_API_KEY:
+    if not secrets.compare_digest(creds.credentials.encode(), PROXY_API_KEY.encode()):
         raise HTTPException(status_code=401, detail="Invalid API key")
     return creds.credentials
 
@@ -191,25 +216,22 @@ def _get_client() -> httpx.AsyncClient:
 
 
 # --------------------------------------------------------------------------- #
-# Helpers
-# --------------------------------------------------------------------------- #
-
-
 def _v3_headers(
     model: str,
     streaming: bool,
     *,
+    api_key: str,
     session_id: str | None = None,
     session_affinity: str | None = None,
 ) -> dict[str, str]:
     headers: dict[str, str] = {
-        "Authorization": f"Bearer {GATEWAY_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        "User-Agent": FX_USER_AGENT,
+        "User-Agent": identity.state["user_agent"],
         "HTTP-Referer": "https://github.com/vercel-labs/fx",
         "X-Title": "fx",
-        "ai-gateway-protocol-version": "0.0.1",
-        "ai-language-model-specification-version": "4",
+        "ai-gateway-protocol-version": identity.state["protocol_version"],
+        "ai-language-model-specification-version": identity.state["specification_version"],
         "ai-language-model-id": model,
         "ai-language-model-streaming": "true" if streaming else "false",
     }
@@ -295,6 +317,89 @@ async def _parse_body(request: Request) -> dict:
     return body if isinstance(body, dict) else {}
 
 
+def _int_tokens(value) -> int:
+    """Coerce an upstream usage token count to int (0 on anything odd)."""
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _iter_remote_image_parts(messages: list) -> list[tuple[dict, int]]:
+    """Collect (message, index) pairs of remote http(s) image_url parts."""
+    targets: list[tuple[dict, int]] = []
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for i, part in enumerate(content):
+            if not isinstance(part, dict) or part.get("type") != "image_url":
+                continue
+            inner = part.get("image_url")
+            url = inner.get("url") if isinstance(inner, dict) else None
+            if isinstance(url, str) and url.startswith(("http://", "https://")):
+                targets.append((msg, i))
+    return targets
+
+
+async def _hydrate_remote_images(client: httpx.AsyncClient, body: dict) -> None:
+    """fx parity: download remote images into data URLs before conversion.
+
+    Data URLs flow straight into the converter's `{type:"file"}` part shape;
+    failures leave the original URL untouched so the request still goes out
+    (matching pre-hydration behaviour instead of failing the request).
+    """
+    if not IMAGE_FETCH or not isinstance(body, dict):
+        return
+    for msg, idx in _iter_remote_image_parts(body.get("messages", [])):
+        url = msg["content"][idx]["image_url"]["url"]
+        try:
+            img_resp = await client.get(url, timeout=IMAGE_FETCH_TIMEOUT, follow_redirects=True)
+            img_resp.raise_for_status()
+            data = img_resp.content
+            if len(data) > IMAGE_FETCH_MAX_BYTES:
+                raise ValueError(f"image exceeds {IMAGE_FETCH_MAX_BYTES} byte limit")
+            media_type = (
+                img_resp.headers.get("content-type", "").split(";")[0].strip()
+                or "application/octet-stream"
+            )
+            encoded = base64.b64encode(data).decode("ascii")
+            msg["content"][idx]["image_url"]["url"] = f"data:{media_type};base64,{encoded}"
+            log.info("hydrated remote image (%d bytes)", len(data))
+        except Exception as exc:
+            log.warning(
+                "remote image fetch failed (%s); passing URL through: %s",
+                exc,
+                url[:120],
+            )
+
+
+async def _tracked_stream(
+    aiter: AsyncIterator[str], caller: str, model: str
+) -> AsyncIterator[str]:
+    """Pass-through SSE generator that extracts usage from the final chunk."""
+    saw_usage = False
+    async for sse in aiter:
+        if '"usage"' in sse and not saw_usage:
+            try:
+                data = json.loads(sse[sse.index("{"):sse.rindex("}") + 1])
+                u = data.get("usage") or {}
+                USAGE.record(
+                    caller,
+                    model=model,
+                    prompt_tokens=_int_tokens(u.get("prompt_tokens")),
+                    completion_tokens=_int_tokens(u.get("completion_tokens")),
+                )
+                saw_usage = True
+            except Exception:
+                pass
+        yield sse
+    if not saw_usage:
+        USAGE.record(caller, model=model)
+
+
 async def _send_upstream(
     client: httpx.AsyncClient, url: str, headers: dict, v3_body: dict
 ) -> httpx.Response:
@@ -303,6 +408,53 @@ async def _send_upstream(
     if resp.status_code != 200:
         await resp.aread()
     return resp
+
+
+async def _upstream_pooled(
+    build: Callable[[str], Awaitable[httpx.Response]],
+) -> tuple[httpx.Response, str]:
+    """Run `build(api_key)` once per pooled key until one attempt succeeds.
+
+    Keys come from KEY_POOL (round-robin when KEY_ROTATION is on). A
+    key-attributable upstream status (401/402/403/408/429/5xx when
+    KEY_FAILOVER is on) or a network error transparently retries the next
+    key; failed responses are closed before retrying. When every key is
+    exhausted the last failing response is returned so callers render their
+    normal error path. With no keys configured, one unauthenticated attempt
+    is made (legacy behaviour).
+    """
+    tried: set[str] = set()
+    last_resp: httpx.Response | None = None
+    last_key = ""
+    last_exc: Exception | None = None
+    while True:
+        key = KEY_POOL.next(exclude=tried)
+        if key is None:
+            if tried or len(KEY_POOL):
+                break
+            key = ""  # no keys configured: single legacy attempt
+        tried.add(key)
+        try:
+            resp = await build(key)
+        except httpx.RequestError as exc:
+            last_exc, last_key = exc, key
+            KEY_POOL.report_failure(key)
+            log.warning("gateway key %s network error (%s); failing over",
+                        mask(key), type(exc).__name__)
+            continue
+        if resp.status_code == 200 or not KEY_POOL.should_failover(resp.status_code):
+            if resp.status_code == 200:
+                KEY_POOL.report_success(key)
+            return resp, key
+        KEY_POOL.report_failure(key)
+        log.warning("gateway key %s -> HTTP %d; failing over", mask(key), resp.status_code)
+        if last_resp is not None:
+            await last_resp.aclose()
+        last_resp, last_key = resp, key
+    if last_resp is not None:
+        return last_resp, last_key
+    assert last_exc is not None
+    raise last_exc
 
 
 # --------------------------------------------------------------------------- #
@@ -361,7 +513,20 @@ async def _collect_response(resp: httpx.Response, model: str) -> dict:
 
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok", "gateway": GATEWAY_BASE_URL, "protocol": "v3"}
+    return {
+        "status": "ok",
+        "gateway": GATEWAY_BASE_URL,
+        "protocol": "v3",
+        "fx": dict(identity.state),
+        "keys": KEY_POOL.stats(),
+        "usage": USAGE.totals(),
+    }
+
+
+@app.get("/v1/usage")
+async def usage_stats(_: str = Depends(verify_proxy_key)):
+    """Per-caller request/token counters recorded since process start."""
+    return USAGE.snapshot()
 
 
 @app.get("/v1/models")
@@ -374,10 +539,15 @@ async def list_models(_: str = Depends(verify_proxy_key)):
         return JSONResponse(content=cache["data"])
 
     url = urljoin(GATEWAY_BASE_URL + "/", GATEWAY_V1_MODELS.lstrip("/"))
-    headers = {"Accept": "application/json"}
-    if GATEWAY_API_KEY:
-        headers["Authorization"] = f"Bearer {GATEWAY_API_KEY}"
-    resp = await client.get(url, headers=headers)
+
+    async def send(key: str) -> httpx.Response:
+        headers = {"Accept": "application/json"}
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        return await client.get(url, headers=headers)
+
+    resp, used_key = await _upstream_pooled(send)
+    log.debug("GET /v1/models via gateway key %s", mask(used_key))
     if resp.status_code != 200:
         return _client_error(resp)
     data = resp.json()
@@ -410,6 +580,9 @@ async def chat_completions(request: Request, _: str = Depends(verify_proxy_key))
 
     _warn_dropped_params(body)
 
+    # fx parity: pull remote images into data URLs before translating.
+    await _hydrate_remote_images(client, body)
+
     stream = bool(body.get("stream", False))
     stream_options = body.get("stream_options")
     include_usage = bool(
@@ -419,29 +592,41 @@ async def chat_completions(request: Request, _: str = Depends(verify_proxy_key))
 
     v3_body = openai_to_v3(
         body,
-        product_user_agent=FX_USER_AGENT,
+        product_user_agent=identity.state["user_agent"],
         product_user_agent_models=PRODUCT_USER_AGENT_MODELS,
     )
     url = urljoin(GATEWAY_BASE_URL + "/", GATEWAY_V3_CHAT.lstrip("/"))
     session_id = request.headers.get("x-session-id") or GATEWAY_SESSION_ID
     session_affinity = request.headers.get("x-session-affinity") or GATEWAY_SESSION_AFFINITY
-    headers = _v3_headers(
-        model, streaming=True, session_id=session_id, session_affinity=session_affinity
-    )
+
+    async def send(key: str) -> httpx.Response:
+        headers = _v3_headers(
+            model,
+            streaming=True,
+            api_key=key,
+            session_id=session_id,
+            session_affinity=session_affinity,
+        )
+        return await _send_upstream(client, url, headers, v3_body)
+
+    resp, used_key = await _upstream_pooled(send)
+    log.debug("POST /v1/chat/completions via gateway key %s", mask(used_key))
+
+    caller = request.client.host if request.client else "unknown"
+    if resp.status_code != 200:
+        USAGE.record(caller, model=model, error=True)
 
     if stream:
-        resp = await _send_upstream(client, url, headers, v3_body)
         if resp.status_code != 200:
             err_resp = _client_error(resp)
             await resp.aclose()
             return err_resp
         return StreamingResponse(
-            _chat_stream(resp, model, include_usage),
+            _tracked_stream(_chat_stream(resp, model, include_usage), caller, model),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    resp = await _send_upstream(client, url, headers, v3_body)
     if resp.status_code != 200:
         err_resp = _client_error(resp)
         await resp.aclose()
@@ -450,6 +635,13 @@ async def chat_completions(request: Request, _: str = Depends(verify_proxy_key))
         result = await _collect_response(resp, model)
     finally:
         await resp.aclose()
+    _u = result.get("usage") or {}
+    USAGE.record(
+        caller,
+        model=model,
+        prompt_tokens=_int_tokens(_u.get("prompt_tokens")),
+        completion_tokens=_int_tokens(_u.get("completion_tokens")),
+    )
     return JSONResponse(content=result)
 
 
@@ -480,20 +672,32 @@ async def responses_route(request: Request, _: str = Depends(verify_proxy_key)):
     chat_body.pop("input", None)
     chat_body.pop("stream", None)
 
+    # fx parity: pull remote images into data URLs before translating.
+    await _hydrate_remote_images(client, chat_body)
+
     v3_body = openai_to_v3(
         chat_body,
-        product_user_agent=FX_USER_AGENT,
+        product_user_agent=identity.state["user_agent"],
         product_user_agent_models=PRODUCT_USER_AGENT_MODELS,
     )
     url = urljoin(GATEWAY_BASE_URL + "/", GATEWAY_V3_CHAT.lstrip("/"))
     session_id = request.headers.get("x-session-id") or GATEWAY_SESSION_ID
     session_affinity = request.headers.get("x-session-affinity") or GATEWAY_SESSION_AFFINITY
-    headers = _v3_headers(
-        model, streaming=True, session_id=session_id, session_affinity=session_affinity
-    )
+
+    async def send(key: str) -> httpx.Response:
+        headers = _v3_headers(
+            model,
+            streaming=True,
+            api_key=key,
+            session_id=session_id,
+            session_affinity=session_affinity,
+        )
+        return await _send_upstream(client, url, headers, v3_body)
+
+    resp, used_key = await _upstream_pooled(send)
+    log.debug("POST /v1/responses via gateway key %s", mask(used_key))
 
     if stream:
-        resp = await _send_upstream(client, url, headers, v3_body)
         if resp.status_code != 200:
             err_resp = _client_error(resp)
             await resp.aclose()
@@ -504,7 +708,6 @@ async def responses_route(request: Request, _: str = Depends(verify_proxy_key)):
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    resp = await _send_upstream(client, url, headers, v3_body)
     if resp.status_code != 200:
         err_resp = _client_error(resp)
         await resp.aclose()
@@ -513,6 +716,14 @@ async def responses_route(request: Request, _: str = Depends(verify_proxy_key)):
         result = await _collect_response(resp, model)
     finally:
         await resp.aclose()
+    caller = request.client.host if request.client else "unknown"
+    _u = result.get("usage") or {}
+    USAGE.record(
+        caller,
+        model=model,
+        prompt_tokens=_int_tokens(_u.get("prompt_tokens")),
+        completion_tokens=_int_tokens(_u.get("completion_tokens")),
+    )
     return JSONResponse(content=openai_to_responses(result, model))
 
 
@@ -526,11 +737,16 @@ async def embeddings(request: Request, _: str = Depends(verify_proxy_key)):
     model = body.get("model") or "openai/text-embedding-3-large"
     body["model"] = model
     url = urljoin(GATEWAY_BASE_URL + "/", "v1/embeddings")
-    headers = {
-        "Authorization": f"Bearer {GATEWAY_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    resp = await client.post(url, headers=headers, json=body)
+
+    async def send(key: str) -> httpx.Response:
+        headers = {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+        }
+        return await client.post(url, headers=headers, json=body)
+
+    resp, used_key = await _upstream_pooled(send)
+    log.debug("POST /v1/embeddings via gateway key %s", mask(used_key))
     if resp.status_code != 200:
         return _client_error(resp)
     return JSONResponse(content=resp.json())
@@ -558,3 +774,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

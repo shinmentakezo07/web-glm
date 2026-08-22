@@ -60,6 +60,15 @@ class _StreamState:
         self.next_tool_index = 0
         self.last_step_usage: dict = {}
         self.finished = False
+        # Tool-call robustness (fx parity): tool-input-start carries the
+        # id -> toolName mapping, because the consolidated tool-call event
+        # may arrive without a toolName. Emitted ids are tracked so a
+        # repeated tool-call event never double-emits at the same index.
+        self.tool_names: dict[str, str] = {}
+        self.emitted_tool_ids: set[str] = set()
+        # Anonymous calls (no toolCallId) can't be deduped by id — every
+        # event mints a fresh one — so they dedupe by (name, args) signature.
+        self.emitted_signatures: set[tuple[str, str]] = set()
 
 
 def _process_stream_event(state: _StreamState, event: dict) -> list[str]:
@@ -72,6 +81,16 @@ def _process_stream_event(state: _StreamState, event: dict) -> list[str]:
         if delta:
             chunks.append(_sse_chunk(state.chat_id, state.model, delta_text=delta))
 
+    elif etype == "tool-input-start":
+        # fx wire pattern: {"type":"tool-input-start","id":"c1",
+        #                   "toolName":"read_file"} — remember the name so a
+        # later consolidated tool-call event that omits toolName still
+        # produces a valid OpenAI tool_call.
+        start_id = event.get("toolCallId", "") or event.get("id", "")
+        start_name = event.get("toolName", "")
+        if start_id and start_name:
+            state.tool_names[start_id] = start_name
+
     elif etype == "tool-input-delta":
         tool_id = event.get("toolCallId", "") or event.get("id", "")
         if tool_id:
@@ -80,15 +99,37 @@ def _process_stream_event(state: _StreamState, event: dict) -> list[str]:
             )
 
     elif etype == "tool-call":
-        tool_id = event.get("toolCallId", "") or event.get("id", "")
-        tool_name = event.get("toolName", "")
-        tool_args = event.get("input", "") or state.tool_input_buffers.get(tool_id, "")
+        raw_id = event.get("toolCallId", "") or event.get("id", "")
+        tool_name = (
+            event.get("toolName", "")
+            or state.tool_names.get(raw_id, "")
+            or state.tool_names.get(event.get("id", ""), "")
+        )
+        tool_args = event.get("input") or state.tool_input_buffers.get(raw_id, "")
         if isinstance(tool_args, (dict, list)):
             try:
                 tool_args = json.dumps(tool_args)
             except (TypeError, ValueError):
                 tool_args = ""
-        tool_args = tool_args or state.tool_input_buffers.get(tool_id, "")
+        tool_args = tool_args or "{}"
+        if raw_id:
+            if raw_id in state.emitted_tool_ids:
+                # Duplicate consolidated event for an id we already
+                # streamed; re-emitting would double-append arguments.
+                return chunks
+        else:
+            # Anonymous call: dedupe by signature (a fresh id is minted
+            # below, so id-based dedupe can never match).
+            signature = (tool_name, tool_args)
+            if signature in state.emitted_signatures:
+                return chunks
+            state.emitted_signatures.add(signature)
+        if not raw_id:
+            # OpenAI clients cannot reply to a call without an id; mint a
+            # stable one (fx tolerates anonymous calls, OpenAI does not).
+            tool_id = f"call_{uuid.uuid4().hex[:24]}"
+        else:
+            tool_id = raw_id
 
         idx = state.tool_call_index.get(tool_id)
         if idx is None:
@@ -115,7 +156,9 @@ def _process_stream_event(state: _StreamState, event: dict) -> list[str]:
             }],
         }
         chunks.append(f"data: {json.dumps(chunk)}\n\n")
+        state.emitted_tool_ids.add(tool_id)
         state.tool_input_buffers.pop(tool_id, None)
+        state.tool_names.pop(tool_id, None)
 
     elif etype == "finish":
         finish_reason = _v3_finish_reason(event.get("finishReason", "stop"))
@@ -141,7 +184,7 @@ def _process_stream_event(state: _StreamState, event: dict) -> list[str]:
     elif etype in (
         "start", "start-step", "tool-result", "source", "file", "raw",
         "text-start", "text-end", "reasoning-start", "reasoning-end",
-        "tool-input-start", "tool-input-end",
+        "tool-input-end",
     ):
         pass  # explicitly handled no-ops: no OpenAI chunk for these
 
@@ -228,19 +271,55 @@ def v3_sse_stream_to_openai(
     usage_data: dict = {}
     step_usage: dict = {}
 
+    # Tool-call robustness (fx parity): correlate tool-input-start names and
+    # tool-input-delta fragments with their consolidated tool-call event.
+    pending_names: dict[str, str] = {}
+    pending_args: dict[str, str] = {}
+    emitted_ids: set[str] = set()
+    emitted_signatures: set[tuple[str, str]] = set()
+
+    def _mint_tool_id() -> str:
+        return f"call_{uuid.uuid4().hex[:24]}"
+
     for event in events:
         etype = event.get("type", "")
         if etype == "text-delta":
             text_parts.append(event.get("delta", ""))
+        elif etype == "tool-input-start":
+            start_id = event.get("toolCallId", "") or event.get("id", "")
+            if start_id and event.get("toolName"):
+                pending_names[start_id] = event["toolName"]
+        elif etype == "tool-input-delta":
+            delta_id = event.get("toolCallId", "") or event.get("id", "")
+            if delta_id:
+                pending_args[delta_id] = (
+                    pending_args.get(delta_id, "") + event.get("delta", "")
+                )
         elif etype == "tool-call":
-            tool_id = event.get("toolCallId", "") or event.get("id", "")
-            tool_name = event.get("toolName", "")
-            tool_args = event.get("input", "")
+            raw_id = event.get("toolCallId", "") or event.get("id", "")
+            tool_name = (
+                event.get("toolName", "")
+                or pending_names.get(raw_id, "")
+            )
+            tool_args = event.get("input") or pending_args.get(raw_id, "")
             if not isinstance(tool_args, str):
                 try:
                     tool_args = json.dumps(tool_args)
                 except (TypeError, ValueError):
                     tool_args = "{}"
+            tool_args = tool_args or "{}"
+            if raw_id:
+                if raw_id in emitted_ids:
+                    continue  # duplicate consolidation; never double-append
+                emitted_ids.add(raw_id)
+            else:
+                # Anonymous call: dedupe by signature since a fresh id is
+                # minted below and id-based dedupe can never match.
+                signature = (tool_name, tool_args)
+                if signature in emitted_signatures:
+                    continue
+                emitted_signatures.add(signature)
+            tool_id = raw_id or _mint_tool_id()
             tool_calls.append({
                 "id": tool_id,
                 "type": "function",
