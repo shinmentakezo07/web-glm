@@ -12,6 +12,7 @@ gateway-proxy/
 │   ├── response.py      #   v3_to_openai() — non-streaming response
 │   ├── streaming.py     #   v3 SSE → OpenAI SSE (live + offline)
 │   ├── responses.py     #   Responses API translation
+│   ├── anthropic.py    #   Anthropic Messages API ↔ OpenAI translation
 │   └── validation.py    #   tool-history pairing checks
 ├── server.py           # FastAPI app + HTTP transport (routes, auth, key pool)
 ├── identity.py         # Background fx identity sync from GitHub

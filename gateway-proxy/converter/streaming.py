@@ -266,6 +266,7 @@ def v3_sse_stream_to_openai(
     """
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     text_parts: list[str] = []
+    reasoning_parts: list[str] = []
     tool_calls: list[dict] = []
     finish_reason = "stop"
     usage_data: dict = {}
@@ -328,6 +329,10 @@ def v3_sse_stream_to_openai(
         elif etype == "finish-step":
             if event.get("usage"):
                 step_usage = event["usage"]
+        elif etype == "reasoning-delta":
+            delta = event.get("delta", "")
+            if delta:
+                reasoning_parts.append(delta)
         elif etype == "finish":
             finish_reason = _v3_finish_reason(event.get("finishReason", "stop"))
             usage_data = event.get("usage", {}) or step_usage or {}
@@ -338,6 +343,14 @@ def v3_sse_stream_to_openai(
             break
 
     full_text = "".join(text_parts)
+    full_reasoning = "".join(reasoning_parts)
+    message: dict = {
+        "role": "assistant",
+        "content": full_text if full_text else (None if tool_calls else ""),
+        **({"tool_calls": tool_calls} if tool_calls else {}),
+    }
+    if full_reasoning:
+        message["reasoning_content"] = full_reasoning
     return {
         "id": chat_id,
         "object": "chat.completion",
@@ -345,11 +358,7 @@ def v3_sse_stream_to_openai(
         "model": model,
         "choices": [{
             "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": full_text if full_text else (None if tool_calls else ""),
-                **({"tool_calls": tool_calls} if tool_calls else {}),
-            },
+            "message": message,
             "finish_reason": finish_reason,
         }],
         "usage": _v3_usage_to_openai(usage_data) if usage_data else {},

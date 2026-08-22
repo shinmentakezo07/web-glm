@@ -128,6 +128,11 @@ class TestOpenAIToV3:
         assert result["topP"] == 0.9
         assert result["stopSequences"] == ["end"]
 
+    def test_top_k_passthrough(self):
+        body = {"messages": [{"role": "user", "content": "x"}], "top_k": 40}
+        result = openai_to_v3(body)
+        assert result["topK"] == 40
+
     def test_stop_string_to_list(self):
         body = {"messages": [{"role": "user", "content": "x"}], "stop": "stop_word"}
         result = openai_to_v3(body)
