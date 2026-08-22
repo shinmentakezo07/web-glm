@@ -692,7 +692,7 @@ class TestAnthropicReasoning:
         assert "thinking_delta" in text
         assert "text_delta" in text
         # thinking block should be closed before text block starts
-        assert text.index("content_block_stop") < text.index("text_delta")
+        assert text.index('"type": "content_block_stop"') < text.index('"type": "text_delta"')
         assert "event: message_stop" in text
 
     def test_no_thinking_no_reasoning_upstream(self):

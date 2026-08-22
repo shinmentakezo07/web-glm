@@ -412,6 +412,14 @@ class _AnthropicStreamState:
 
     def text_delta(self, delta: str) -> str:
         out = ""
+        # If a thinking block is open, close it before starting the text block
+        # (Anthropic protocol: content blocks are sequential, not interleaved).
+        if self.thinking_started:
+            out += self._sse({
+                "type": "content_block_stop",
+                "index": self.thinking_block_index,
+            })
+            self.thinking_started = False
         if not self.text_started:
             self.text_started = True
             self.text_block_index = self.next_block_index
@@ -442,6 +450,13 @@ class _AnthropicStreamState:
         call_id = tc.get("id", "")
 
         out = ""
+        # If a thinking block is open, close it before starting the tool block.
+        if self.thinking_started:
+            out += self._sse({
+                "type": "content_block_stop",
+                "index": self.thinking_block_index,
+            })
+            self.thinking_started = False
         if idx not in self.tools:
             tool_index = self.next_block_index
             self.next_block_index += 1

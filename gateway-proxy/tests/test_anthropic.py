@@ -510,22 +510,23 @@ class TestAnthropicStreaming:
         assert "thinking" in out
         assert "thinking_delta" in out
 
-        # Text delta — should be a separate block
+        # Text delta — should be a separate block; closes thinking first
         out = openai_chunk_to_anthropic_sse(self._chunk(
             choices=[{"index": 0, "delta": {"content": "answer"}, "finish_reason": None}],
         ), state)
         assert "text_delta" in out
         assert "content_block_start" in out  # new text block started
+        assert "content_block_stop" in out  # thinking block closed
 
-        # Finish — should close both blocks
+        # Finish — should close the text block (thinking already closed)
         out = openai_chunk_to_anthropic_sse(self._chunk(
             choices=[{"index": 0, "delta": {}, "finish_reason": "stop"}],
             usage={"prompt_tokens": 1, "completion_tokens": 1},
         ), state)
-        # Two content_block_stop events: thinking + text
+        # One content_block_stop event for the text block (thinking closed earlier)
         stops = [l for l in out.split("\n") if l.strip().startswith("data:")
                  and "content_block_stop" in l]
-        assert len(stops) == 2
+        assert len(stops) == 1
         assert "message_stop" in out
 
     def test_stream_thinking_then_tool_indices(self):
@@ -621,18 +622,19 @@ class TestAnthropicStreamAsync:
         assert "thinking_delta" in sse
         assert "text_delta" in sse
         # thinking block should be closed before text block starts
-        thinking_stop_idx = sse.index("content_block_stop")
-        text_start_idx = sse.index('"text_delta"')
+        thinking_stop_idx = sse.index('"type": "content_block_stop"')
+        text_start_idx = sse.index('"type": "text_delta"')
         assert thinking_stop_idx < text_start_idx
         assert "message_stop" in sse
 
     def test_full_stream_reasoning_then_tool(self):
-        chunks = [
-            f"data: {json.dumps({'id': 'x', 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n",
-            f"data: {json.dumps({'id': 'x', 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {'reasoning_content': 'need a tool'}, 'finish_reason': None}]})}\n\n",
-            f"data: {json.dumps({'id': 'x', 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {'tool_calls': [{'index': 0, 'id': 'call_1', 'type': 'function', 'function': {'name': 'f', 'arguments': '{}'}}]}}, 'finish_reason': None}]})}\n\n",
-            f"data: {json.dumps({'id': 'x', 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'tool_calls'}], 'usage': {'prompt_tokens': 1, 'completion_tokens': 1}})}\n\n",
+        chunk_data = [
+            {"id": "x", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]},
+            {"id": "x", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": "need a tool"}, "finish_reason": None}]},
+            {"id": "x", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_1", "type": "function", "function": {"name": "f", "arguments": "{}"}}], "finish_reason": None}}]},
+            {"id": "x", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}], "usage": {"prompt_tokens": 1, "completion_tokens": 1}},
         ]
+        chunks = [f"data: {json.dumps(d)}\n\n" for d in chunk_data]
         sse = run_anthropic_stream(chunks)
         assert "thinking_delta" in sse
         assert "input_json_delta" in sse
