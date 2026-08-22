@@ -1,0 +1,11 @@
+gateway-proxy/.env
+gateway-proxy/.env.*
+!gateway-proxy/.env.example
+**/__pycache__/
+*.pyc
+.pytest_cache/
+gateway-proxy/proxy.log
+gateway-proxy/tests/
+Dockerfile
+.dockerignore
+docker-compose.yml
