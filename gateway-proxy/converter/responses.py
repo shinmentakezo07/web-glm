@@ -143,6 +143,7 @@ class _ResponsesStreamState:
         self.response_id = f"resp_{uuid.uuid4().hex[:16]}"
         self.model = model
         self.msg_id: str | None = None
+        self.msg_started = False  # message item created lazily on first text
         self.tool_ids: dict[str, str] = {}   # call_id -> fc_ item id
         self.tool_index: dict[str, int] = {}  # call_id -> output index
         self.text_parts: list[str] = []
@@ -153,10 +154,15 @@ class _ResponsesStreamState:
     def _sse(self, obj: dict) -> str:
         return f"data: {json.dumps(obj)}\n\n"
 
+    def _output_index_for_tools(self) -> int:
+        """Output index for the next tool item: 0 if no message, 1 if message."""
+        return 1 if self.msg_started else 0
+
     def start(self) -> str:
-        """Emit response.created + output_item.added + content_part.added."""
+        """Emit response.created. The message item is created lazily in
+        text_delta() so tool-only responses don't emit a dangling empty
+        message item."""
         self.started = True
-        self.msg_id = f"msg_{uuid.uuid4().hex[:16]}"
         response = {
             "id": self.response_id,
             "object": "response",
@@ -165,8 +171,16 @@ class _ResponsesStreamState:
             "model": self.model,
             "output": [],
         }
-        out = self._sse({"type": "response.created", "response": response})
-        out += self._sse({
+        return self._sse({"type": "response.created", "response": response})
+
+    def _ensure_message_item(self) -> str:
+        """Lazily create the message item (index 0) on first text delta.
+        Returns the SSE events for item/part creation, or "" if already started."""
+        if self.msg_started:
+            return ""
+        self.msg_started = True
+        self.msg_id = f"msg_{uuid.uuid4().hex[:16]}"
+        out = self._sse({
             "type": "response.output_item.added",
             "output_index": 0,
             "item": {
@@ -186,13 +200,15 @@ class _ResponsesStreamState:
         return out
 
     def text_delta(self, delta: str) -> str:
+        out = self._ensure_message_item()
         self.text_parts.append(delta)
-        return self._sse({
+        out += self._sse({
             "type": "response.output_text.delta",
             "item_id": self.msg_id,
             "output_index": 0,
             "delta": delta,
         })
+        return out
 
     def tool_call(self, call: dict) -> str:
         """Emit output_item.added + function_call_arguments.delta for a
@@ -201,6 +217,7 @@ class _ResponsesStreamState:
         fn = call.get("function", {})
         name = fn.get("name", "")
         args = fn.get("arguments", "")
+        base_index = self._output_index_for_tools()
         if call_id in self.tool_ids:
             item_id = self.tool_ids[call_id]
             idx = self.tool_index[call_id]
@@ -220,7 +237,7 @@ class _ResponsesStreamState:
             })
             out = self._sse({
                 "type": "response.output_item.added",
-                "output_index": idx + 1,
+                "output_index": base_index + idx,
                 "item": self.tool_calls[-1],
             })
         if args:
@@ -231,7 +248,7 @@ class _ResponsesStreamState:
             out += self._sse({
                 "type": "response.function_call_arguments.delta",
                 "item_id": item_id,
-                "output_index": idx + 1,
+                "output_index": base_index + idx,
                 "delta": args,
             })
         return out
@@ -240,16 +257,15 @@ class _ResponsesStreamState:
         """Emit output_text.done / output_item.done for each item + response.completed."""
         out = ""
         full_text = "".join(self.text_parts)
-        # The message item at index 0 is always added by start(); close it even
-        # when there's no text (tool-only response) so it isn't left dangling.
-        if full_text:
+        base_index = self._output_index_for_tools()
+        # Only close the message item if it was created (text was received).
+        if self.msg_started:
             out += self._sse({
                 "type": "response.output_text.done",
                 "item_id": self.msg_id,
                 "output_index": 0,
                 "text": full_text,
             })
-        if self.msg_id is not None:
             out += self._sse({
                 "type": "response.output_item.done",
                 "output_index": 0,
@@ -270,7 +286,7 @@ class _ResponsesStreamState:
             item["status"] = "completed"
             out += self._sse({
                 "type": "response.output_item.done",
-                "output_index": i + 1,
+                "output_index": base_index + i,
                 "item": item,
             })
 

@@ -45,6 +45,7 @@ import asyncio
 import base64
 import secrets
 import logging
+from logging.handlers import RotatingFileHandler
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from urllib.parse import urljoin
@@ -124,6 +125,7 @@ MODELS_CACHE_TTL = float(os.getenv("MODELS_CACHE_TTL", "300"))
 IMAGE_FETCH = os.getenv("IMAGE_FETCH", "1").lower() in ("1", "true", "yes", "on")
 IMAGE_FETCH_TIMEOUT = float(os.getenv("IMAGE_FETCH_TIMEOUT", "10"))
 IMAGE_FETCH_MAX_BYTES = int(os.getenv("IMAGE_FETCH_MAX_BYTES", str(5 * 1024 * 1024)))
+MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(10 * 1024 * 1024)))
 
 GATEWAY_V3_CHAT = "/v3/ai/language-model"
 GATEWAY_V1_MODELS = "/v1/models"
@@ -136,8 +138,12 @@ log = logging.getLogger("gateway-proxy")
 
 # Also write logs to a file so the dashboard can read them back.
 LOG_FILE = os.getenv("LOG_FILE", os.path.join(os.getcwd(), "proxy.log"))
+LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", str(10 * 1024 * 1024)))  # 10 MiB
+LOG_BACKUP_COUNT = int(os.getenv("LOG_BACKUP_COUNT", "3"))
 try:
-    _file_handler = logging.FileHandler(LOG_FILE)
+    _file_handler = RotatingFileHandler(
+        LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT
+    )
     _file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
     log.addHandler(_file_handler)
 except OSError:
@@ -218,7 +224,7 @@ async def dashboard_page():
 
 
 # --------------------------------------------------------------------------- #
-# Anthropic error handling
+# Error types
 # --------------------------------------------------------------------------- #
 
 
@@ -237,6 +243,10 @@ class AnthropicError(Exception):
         super().__init__(message)
 
 
+class _BodyTooLarge(Exception):
+    """Raised when a request body exceeds MAX_REQUEST_BODY_BYTES."""
+
+
 @app.exception_handler(AnthropicError)
 async def _anthropic_error_handler(request: Request, exc: AnthropicError):
     return JSONResponse(
@@ -251,6 +261,19 @@ async def _anthropic_error_handler(request: Request, exc: AnthropicError):
 # --------------------------------------------------------------------------- #
 # Request logging middleware
 # --------------------------------------------------------------------------- #
+
+
+@app.exception_handler(_BodyTooLarge)
+async def _body_too_large_handler(request: Request, exc: _BodyTooLarge):
+    return JSONResponse(
+        status_code=413,
+        content={
+            "error": {
+                "message": "Request body too large",
+                "type": "invalid_request_error",
+            }
+        },
+    )
 
 
 @app.middleware("http")
@@ -410,8 +433,17 @@ def _warn_dropped_params(body: dict) -> None:
 
 
 async def _parse_body(request: Request) -> dict:
+    cl = request.headers.get("content-length")
+    if cl and int(cl) > MAX_REQUEST_BODY_BYTES:
+        raise _BodyTooLarge()
     try:
-        body = await request.json()
+        raw = await request.body()
+    except Exception:
+        return {}
+    if len(raw) > MAX_REQUEST_BODY_BYTES:
+        raise _BodyTooLarge()
+    try:
+        body = json.loads(raw)
     except Exception:
         return {}
     return body if isinstance(body, dict) else {}
@@ -606,10 +638,18 @@ async def _upstream_pooled(
             KEY_POOL.report_failure(key)
             log.warning("gateway key %s network error (%s); failing over",
                         mask(key), type(exc).__name__)
+            # Close any previously held response before continuing so we
+            # don't leak a connection from a prior failed attempt.
+            if last_resp is not None:
+                await last_resp.aclose()
+                last_resp = None
             continue
         if resp.status_code == 200 or not KEY_POOL.should_failover(resp.status_code):
             if resp.status_code == 200:
                 KEY_POOL.report_success(key)
+            # Close any prior failed response we were holding.
+            if last_resp is not None:
+                await last_resp.aclose()
             return resp, key
         KEY_POOL.report_failure(key)
         log.warning("gateway key %s -> HTTP %d; failing over", mask(key), resp.status_code)
@@ -762,9 +802,12 @@ async def logs_api(limit: int = 200):
     lines: list[str] = []
     try:
         with open(LOG_FILE, "r", errors="replace") as f:
-            # Read the last `limit` lines efficiently
-            all_lines = f.readlines()
-            lines = all_lines[-limit:]
+            # Read the last `limit` lines efficiently using a rolling deque.
+            from collections import deque
+            buf: deque[str] = deque(maxlen=limit)
+            for line in f:
+                buf.append(line)
+            lines = list(buf)
     except (OSError, FileNotFoundError):
         pass
     return {"lines": lines, "file": LOG_FILE}
@@ -806,7 +849,7 @@ async def chat_completions(request: Request, _: str = Depends(verify_proxy_key))
 
     body = await _parse_body(request)
     if not body:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
+        return _invalid_request("Invalid JSON body")
 
     model = body.get("model") or DEFAULT_MODEL
     if not isinstance(model, str) or not model:
@@ -891,7 +934,7 @@ async def responses_route(request: Request, _: str = Depends(verify_proxy_key)):
 
     body = await _parse_body(request)
     if not body:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
+        return _invalid_request("Invalid JSON body")
 
     model = body.get("model") or DEFAULT_MODEL
     if not isinstance(model, str) or not model:
@@ -972,7 +1015,7 @@ async def embeddings(request: Request, _: str = Depends(verify_proxy_key)):
     client = _get_client()
     body = await _parse_body(request)
     if not body:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
+        return _invalid_request("Invalid JSON body")
 
     model = body.get("model") or "openai/text-embedding-3-large"
     body["model"] = model
@@ -1071,7 +1114,7 @@ async def anthropic_messages(request: Request, _: str = Depends(verify_anthropic
         log.warning("rejected /v1/messages request: %s", err)
         return _anthropic_invalid_request(f"Invalid messages: {err}")
 
-    _warn_dropped_params(oai_body)
+    _warn_dropped_params(body)
 
     stream = bool(body.get("stream", False))
 

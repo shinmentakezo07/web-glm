@@ -223,6 +223,18 @@ class TestChatCompletions:
         assert err["type"] == "invalid_request_error"
         assert "no preceding assistant" in err["message"]
 
+    def test_invalid_json_returns_openai_error_shape(self):
+        with setup_test_client([]) as client:
+            resp = client.post(
+                "/v1/chat/completions",
+                headers=AUTH_HEADERS,
+                content=b"not json",
+            )
+        assert resp.status_code == 400
+        err = resp.json()["error"]
+        assert err["type"] == "invalid_request_error"
+        assert "Invalid JSON body" in err["message"]
+
     def test_tool_call_round_trip_non_stream(self):
         calls: list[dict] = []
         with setup_test_client(calls) as client:

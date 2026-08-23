@@ -19,7 +19,7 @@ from .parts import (
 def openai_to_v3(
     body: dict,
     *,
-    product_user_agent: str = "fx/0.0.5",
+    product_user_agent: str | None = None,
     product_user_agent_models: frozenset[str] | None = frozenset({"zai/glm-5.2"}),
 ) -> dict:
     """Convert an OpenAI chat-completions request to AI SDK v3 format.
@@ -33,6 +33,8 @@ def openai_to_v3(
     `product_user_agent` / `product_user_agent_models` control the body-level
     `headers.user-agent` (fx only sends it for zai/glm-5.2). Pass
     `product_user_agent_models=None` for all models, `frozenset()` for none.
+    When `product_user_agent` is None, no body-level headers are emitted
+    (server.py always passes the live fx identity from identity.state).
 
     Does NOT modify the input body.
     """
@@ -107,7 +109,9 @@ def openai_to_v3(
         "tools": v3_tools,
         "toolChoice": _normalize_tool_choice(body.get("tool_choice", {"type": "auto"})),
     }
-    if product_user_agent_models is None or model in product_user_agent_models:
+    if product_user_agent and (
+        product_user_agent_models is None or model in product_user_agent_models
+    ):
         v3_body["headers"] = {"user-agent": product_user_agent}
 
     if "temperature" in body:

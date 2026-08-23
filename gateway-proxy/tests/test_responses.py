@@ -121,14 +121,17 @@ class TestResponsesStreaming:
         )
         out = openai_chunk_to_responses_sse(chunk, state)
         assert json.loads(out.split("\n\n")[0][6:])["type"] == "response.created"
-        assert "response.output_item.added" in out
-        assert "response.content_part.added" in out
 
         out = openai_chunk_to_responses_sse(
             self._chunk(choices=[{"index": 0, "delta": {"content": "hello"}, "finish_reason": None}]),
             state,
         )
-        ev = json.loads(out.split("\n\n")[0][6:])
+        # Message item is created lazily on first text delta.
+        assert "response.output_item.added" in out
+        assert "response.content_part.added" in out
+        delta_events = [e for e in out.split("\n\n") if "output_text.delta" in e]
+        assert delta_events
+        ev = json.loads(delta_events[0][6:])
         assert ev["type"] == "response.output_text.delta"
         assert ev["delta"] == "hello"
 
@@ -164,11 +167,13 @@ class TestResponsesStreaming:
         )
         assert "response.completed" in out
         final = json.loads([l for l in out.split("\n\n") if l.startswith("data:")][-1][6:])
+        # Tool-only response: no empty message item in the output.
         fc = final["response"]["output"][0]
         assert fc["type"] == "function_call"
         assert fc["call_id"] == "call_1"
         assert fc["name"] == "calc"
         assert fc["status"] == "completed"
+        assert len(final["response"]["output"]) == 1, "no dangling empty message"
 
     def test_done_passthrough(self):
         state = _ResponsesStreamState("gpt-4")

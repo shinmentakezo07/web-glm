@@ -69,6 +69,11 @@ class UsageStore:
                 self._db_path, check_same_thread=False, isolation_level=None
             )
             self._conn.row_factory = sqlite3.Row
+            # WAL mode allows concurrent readers without blocking writers;
+            # a busy timeout lets us wait briefly instead of erroring
+            # when another connection holds the lock.
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA busy_timeout=5000")
             self._conn.executescript(_SCHEMA)
         return self._conn
 
@@ -252,7 +257,7 @@ class UsageStore:
             since = time.time() - 3600
         rows = self._query(
             """SELECT ts, prompt_tokens, completion_tokens, cached_tokens
-               FROM requests WHERE ts >= ? ORDER BY ts""",
+               FROM requests WHERE ts >= ? ORDER BY id""",
             (since,),
         )
         if not rows:

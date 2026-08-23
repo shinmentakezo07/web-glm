@@ -80,6 +80,22 @@ class TestStreaming:
                     return
         assert False, "finish chunk not found"
 
+    def test_created_timestamp_consistent_across_chunks(self):
+        """All chunks in a stream must share the same `created` timestamp."""
+        events = [
+            {"type": "text-delta", "delta": "hel"},
+            {"type": "text-delta", "delta": "lo"},
+            {"type": "finish", "finishReason": "stop",
+             "usage": {"inputTokens": {"total": 3}, "outputTokens": {"total": 2}}},
+        ]
+        sse = v3_stream_to_openai(events, model="gpt-4")
+        created_values = set()
+        for line in sse.split("\n\n"):
+            if line.startswith("data: ") and "[DONE]" not in line:
+                obj = json.loads(line[6:])
+                created_values.add(obj["created"])
+        assert len(created_values) == 1, f"expected 1 created value, got {created_values}"
+
     def test_stream_multiple_tool_calls_sequential_indices(self):
         events = [
             {"type": "tool-call", "toolCallId": "call_1", "toolName": "read", "input": {}},

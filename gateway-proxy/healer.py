@@ -69,22 +69,27 @@ def make_probe(client: httpx.AsyncClient, url: str):
 
 
 async def heal_loop(
-    client: httpx.AsyncClient, pool: KeyPool, models_url: str, interval: float
+    pool: KeyPool, models_url: str, interval: float
 ) -> None:
-    """Sweep cooling keys every `interval` seconds. Never raises."""
-    probe = make_probe(client, models_url)
-    while True:
-        await asyncio.sleep(interval)
-        try:
-            await heal_once(pool, probe)
-        except Exception as exc:  # noqa: BLE001 — the loop must survive bugs
-            log.warning("key-healer sweep failed unexpectedly: %r", exc)
+    """Sweep cooling keys every `interval` seconds. Never raises.
+
+    Uses a dedicated httpx client so healer probes don't compete with real
+    requests for connection-pool slots on the shared app client.
+    """
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        probe = make_probe(client, models_url)
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await heal_once(pool, probe)
+            except Exception as exc:  # noqa: BLE001 — the loop must survive bugs
+                log.warning("key-healer sweep failed unexpectedly: %r", exc)
 
 
 def start(
     app_state: object, *, pool: KeyPool, models_url: str
 ) -> asyncio.Task | None:
-    """Start the background healer sharing the app's httpx client.
+    """Start the background healer with its own httpx client.
 
     Returns the task (cancel at shutdown), or None when disabled or there
     is nothing to heal.
@@ -92,11 +97,10 @@ def start(
     if not ENABLED:
         log.info("key healer disabled (KEY_HEALER=0)")
         return None
-    client: httpx.AsyncClient | None = getattr(app_state, "client", None)
-    if client is None or not len(pool):
+    if not len(pool):
         return None
     log.info("key healer: sweeping cooling keys every %.0fs via %s", HEAL_INTERVAL, models_url)
-    task = asyncio.create_task(heal_loop(client, pool, models_url, HEAL_INTERVAL))
+    task = asyncio.create_task(heal_loop(pool, models_url, HEAL_INTERVAL))
     task.add_done_callback(_log_unexpected_exit)
     return task
 

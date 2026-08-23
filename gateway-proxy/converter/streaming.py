@@ -28,6 +28,7 @@ def _sse_chunk(
     role: str | None = None,
     usage: dict | None = None,
     reasoning_delta: str | None = None,
+    created: int | None = None,
 ) -> str:
     delta: dict = {}
     if role:
@@ -39,7 +40,7 @@ def _sse_chunk(
     chunk = {
         "id": chat_id,
         "object": "chat.completion.chunk",
-        "created": int(time.time()),
+        "created": created if created is not None else int(time.time()),
         "model": model,
         "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
     }
@@ -55,6 +56,7 @@ class _StreamState:
         self.chat_id = chat_id
         self.model = model
         self.include_usage = include_usage
+        self.created = int(time.time())
         self.tool_input_buffers: dict[str, str] = {}
         self.tool_call_index: dict[str, int] = {}
         self.next_tool_index = 0
@@ -79,7 +81,7 @@ def _process_stream_event(state: _StreamState, event: dict) -> list[str]:
     if etype == "text-delta":
         delta = event.get("delta", "")
         if delta:
-            chunks.append(_sse_chunk(state.chat_id, state.model, delta_text=delta))
+            chunks.append(_sse_chunk(state.chat_id, state.model, delta_text=delta, created=state.created))
 
     elif etype == "tool-input-start":
         # fx wire pattern: {"type":"tool-input-start","id":"c1",
@@ -140,7 +142,7 @@ def _process_stream_event(state: _StreamState, event: dict) -> list[str]:
         chunk = {
             "id": state.chat_id,
             "object": "chat.completion.chunk",
-            "created": int(time.time()),
+            "created": state.created,
             "model": state.model,
             "choices": [{
                 "index": 0,
@@ -164,13 +166,13 @@ def _process_stream_event(state: _StreamState, event: dict) -> list[str]:
         finish_reason = _v3_finish_reason(event.get("finishReason", "stop"))
         usage_data = event.get("usage", {}) or state.last_step_usage or {}
         usage = _v3_usage_to_openai(usage_data) if (usage_data and state.include_usage) else None
-        chunks.append(_sse_chunk(state.chat_id, state.model, finish_reason=finish_reason, usage=usage))
+        chunks.append(_sse_chunk(state.chat_id, state.model, finish_reason=finish_reason, usage=usage, created=state.created))
         state.finished = True
 
     elif etype == "reasoning-delta":
         delta = event.get("delta", "")
         if delta:
-            chunks.append(_sse_chunk(state.chat_id, state.model, reasoning_delta=delta))
+            chunks.append(_sse_chunk(state.chat_id, state.model, reasoning_delta=delta, created=state.created))
 
     elif etype == "finish-step":
         usage_data = event.get("usage", {})
@@ -193,7 +195,7 @@ def _process_stream_event(state: _StreamState, event: dict) -> list[str]:
         err = event.get("error", {})
         if isinstance(err, dict) and err.get("message"):
             chunks.append(f"data: {json.dumps({'type': 'error', 'error': {'message': err['message']}})}\n\n")
-        chunks.append(_sse_chunk(state.chat_id, state.model, finish_reason="stop"))
+        chunks.append(_sse_chunk(state.chat_id, state.model, finish_reason="stop", created=state.created))
         state.finished = True
 
     return chunks
@@ -217,8 +219,8 @@ def v3_stream_to_openai(
             if ev.get("type") == "response-metadata" and ev.get("modelId"):
                 model = ev["modelId"]
                 break
-    chunks: list[str] = [_sse_chunk(chat_id, model, role="assistant")]
     state = _StreamState(chat_id, model, include_usage)
+    chunks: list[str] = [_sse_chunk(chat_id, model, role="assistant", created=state.created)]
     for event in events:
         chunks.extend(_process_stream_event(state, event))
         if state.finished:
@@ -239,9 +241,9 @@ async def v3_stream_iter(
     response.
     """
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
-    yield _sse_chunk(chat_id, model, role="assistant")
-
     state = _StreamState(chat_id, model, include_usage)
+    yield _sse_chunk(chat_id, model, role="assistant", created=state.created)
+
     async for event in events:
         for chunk in _process_stream_event(state, event):
             yield chunk

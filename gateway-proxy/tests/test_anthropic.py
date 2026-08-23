@@ -544,6 +544,7 @@ class TestAnthropicStreaming:
                           and "content_block_start" in l]
         assert thinking_start[0]["index"] == 0
         assert thinking_start[0]["content_block"]["type"] == "thinking"
+        assert thinking_start[0]["content_block"].get("signature") == ""
 
         # Text
         out_text = openai_chunk_to_anthropic_sse(self._chunk(
@@ -610,6 +611,17 @@ class TestAnthropicStreamAsync:
         assert "message_start" in sse
         assert "message_stop" in sse
 
+    def test_ping_event_after_message_start(self):
+        """Claude Code's SDK expects a ping event after message_start."""
+        chunks = [
+            f"data: {json.dumps({'id': 'x', 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n",
+        ]
+        sse = run_anthropic_stream(chunks)
+        assert "message_start" in sse
+        assert '"type": "ping"' in sse
+        # ping must come after message_start
+        assert sse.index("message_start") < sse.index('"type": "ping"')
+
     def test_full_stream_with_reasoning(self):
         chunks = [
             f"data: {json.dumps({'id': 'x', 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n",
@@ -656,10 +668,31 @@ class TestAnthropicStreamAsync:
         assert stops == 1, f"expected exactly one message_stop, got {stops}"
         assert "message_delta" in sse
 
-
-# =====================================================================
-# Token counting
-# =====================================================================
+    def test_message_delta_usage_only_has_output_tokens(self):
+        """Per Anthropic streaming spec, message_delta usage carries only
+        cumulative output_tokens, not input_tokens."""
+        chunk_data = [
+            {"id": "x", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]},
+            {"id": "x", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": None}]},
+            {"id": "x", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 10, "completion_tokens": 5}},
+        ]
+        chunks = [f"data: {json.dumps(d)}\n\n" for d in chunk_data]
+        sse = run_anthropic_stream(chunks)
+        # Extract the message_delta event
+        events = []
+        for block in sse.split("\n\n"):
+            for line in block.split("\n"):
+                if line.startswith("data: "):
+                    try:
+                        ev = json.loads(line[6:])
+                        if ev.get("type") == "message_delta":
+                            events.append(ev)
+                    except json.JSONDecodeError:
+                        pass
+        assert len(events) >= 1
+        usage = events[0].get("usage", {})
+        assert "output_tokens" in usage
+        assert "input_tokens" not in usage, "message_delta must not carry input_tokens"
 
 
 class TestCountTokens:

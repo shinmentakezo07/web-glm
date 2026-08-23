@@ -143,8 +143,10 @@ class TestStart:
         )
 
     def test_no_client_no_task(self):
+        # The healer now creates its own client, so a missing app client
+        # is no longer a blocker. But an empty pool still returns None.
         assert (
-            start(object(), pool=KeyPool(["k1"]), models_url="https://gw.test/v1/models") is None
+            start(object(), pool=KeyPool([]), models_url="https://gw.test/v1/models") is None
         )
 
     def test_empty_pool_no_task(self):

@@ -81,20 +81,19 @@ def _anthropic_content_to_openai(content) -> tuple[str | list, list[dict] | None
     return parts, tool_calls
 
 
-def _extract_tool_result(msg: dict) -> tuple[str | None, str, list[dict] | None]:
-    """Extract (tool_call_id, content, content_blocks) from a tool_result block.
+def _extract_tool_result(msg: dict) -> tuple[str | None, str]:
+    """Extract (tool_call_id, content) from a tool_result block.
 
-    ``content`` is the OpenAI tool message string content. ``content_blocks``
-    is the list of original Anthropic blocks for text/JSON results.
+    ``content`` is the OpenAI tool message string content, serialized from
+    text and JSON parts.
     """
     tool_use_id = msg.get("tool_use_id", "")
     content = msg.get("content")
 
     if isinstance(content, str):
-        return tool_use_id, content, None
+        return tool_use_id, content
     if isinstance(content, list):
         parts: list[str] = []
-        blocks: list[dict] = []
         for part in content:
             if isinstance(part, str):
                 parts.append(part)
@@ -110,10 +109,10 @@ def _extract_tool_result(msg: dict) -> tuple[str | None, str, list[dict] | None]
                         parts.append(str(raw))
                 else:
                     parts.append(json.dumps(part))
-        return tool_use_id, "".join(parts), content if blocks is not None else None
+        return tool_use_id, "".join(parts)
     if content is not None:
-        return tool_use_id, str(content), None
-    return tool_use_id, "", None
+        return tool_use_id, str(content)
+    return tool_use_id, ""
 
 
 def anthropic_to_openai(body: dict) -> dict:
@@ -177,7 +176,7 @@ def anthropic_to_openai(body: dict) -> dict:
                 user_parts.append({"type": "text", "text": str(block)})
                 continue
             if block.get("type") == "tool_result":
-                tc_id, tc_content, _ = _extract_tool_result(block)
+                tc_id, tc_content = _extract_tool_result(block)
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc_id,
@@ -373,7 +372,7 @@ class _AnthropicStreamState:
 
     def start(self) -> str:
         self.started = True
-        return self._sse({
+        out = self._sse({
             "type": "message_start",
             "message": {
                 "id": self.msg_id,
@@ -391,6 +390,9 @@ class _AnthropicStreamState:
                 },
             },
         })
+        # Claude Code's SDK expects a ping event after message_start.
+        out += self._sse({"type": "ping"})
+        return out
 
     def thinking_delta(self, delta: str) -> str:
         out = ""
@@ -401,7 +403,7 @@ class _AnthropicStreamState:
             out += self._sse({
                 "type": "content_block_start",
                 "index": self.thinking_block_index,
-                "content_block": {"type": "thinking", "thinking": ""},
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""},
             })
         out += self._sse({
             "type": "content_block_delta",
@@ -520,16 +522,21 @@ class _AnthropicStreamState:
         if usage:
             self.usage = _openai_usage_to_anthropic(usage)
 
+        # message_delta carries cumulative output_tokens only (per Anthropic
+        # streaming spec); input_tokens are set in message_start.
+        delta_usage: dict
+        if self.usage:
+            delta_usage = {"output_tokens": self.usage.get("output_tokens", 0)}
+        else:
+            delta_usage = {"output_tokens": 0}
+
         out += self._sse({
             "type": "message_delta",
             "delta": {
                 "stop_reason": stop_reason,
                 "stop_sequence": None,
             },
-            "usage": self.usage if self.usage else {
-                "input_tokens": 0,
-                "output_tokens": 0,
-            },
+            "usage": delta_usage,
         })
         out += self._sse({"type": "message_stop"})
         return out
@@ -667,8 +674,20 @@ def count_anthropic_tokens(body: dict) -> int:
                         total_chars += len(tc_content)
                     elif isinstance(tc_content, list):
                         for part in tc_content:
-                            if isinstance(part, dict):
-                                total_chars += len(part.get("text", ""))
+                            if isinstance(part, str):
+                                total_chars += len(part)
+                            elif isinstance(part, dict):
+                                if part.get("type") == "text":
+                                    total_chars += len(part.get("text", ""))
+                                elif part.get("type") == "json":
+                                    raw = part.get("json", "")
+                                    try:
+                                        total_chars += len(
+                                            json.dumps(raw)
+                                            if not isinstance(raw, str) else raw
+                                        )
+                                    except (TypeError, ValueError):
+                                        pass
 
     # Tools contribute tokens too
     for tool in body.get("tools", []):
