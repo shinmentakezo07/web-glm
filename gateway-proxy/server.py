@@ -79,6 +79,7 @@ from converter.anthropic import (
     count_anthropic_tokens,
 )
 
+import healer
 import identity
 from keys import KeyPool, load_keys, mask
 from db import UsageStore
@@ -169,8 +170,8 @@ async def lifespan(app: FastAPI):
     if not len(KEY_POOL):
         log.warning("no AI_GATEWAY_API_KEY / AI_GATEWAY_API_KEY_N set — upstream will reject requests")
     else:
-        log.info("key pool: %d key(s)  rotation=%s  failover=%s  cooldown=%.0fs",
-                 len(KEY_POOL), KEY_POOL.rotation, KEY_POOL.failover,
+        log.info("key pool: %d key(s)  failover=%s  cooldown=%.0fs",
+                 len(KEY_POOL), KEY_POOL.failover,
                  KEY_POOL.cooldown_seconds)
         for _k in KEY_POOL.keys:
             log.info("  gateway key %s", mask(_k))
@@ -181,10 +182,18 @@ async def lifespan(app: FastAPI):
         # any request, then start the periodic background refresher.
         await identity.initialize(app.state)
         app.state.identity_task = identity.start(app.state)
+        # Key healer: probe cooling keys in the background and restore
+        # healthy ones before their full cooldown elapses.
+        app.state.healer_task = healer.start(
+            app.state,
+            pool=KEY_POOL,
+            models_url=urljoin(GATEWAY_BASE_URL + "/", GATEWAY_V1_MODELS.lstrip("/")),
+        )
     yield
-    task: asyncio.Task | None = getattr(app.state, "identity_task", None)
-    if task is not None:
-        task.cancel()
+    for _name in ("identity_task", "healer_task"):
+        _task: asyncio.Task | None = getattr(app.state, _name, None)
+        if _task is not None:
+            _task.cancel()
     await app.state.client.aclose()
 
 
@@ -479,14 +488,36 @@ async def _hydrate_remote_images(client: httpx.AsyncClient, body: dict) -> None:
             )
 
 
+def _merge_usage(dst: dict, src: dict) -> dict:
+    """Merge non-zero token counts from src into dst (max wins)."""
+    for k in ("prompt_tokens", "completion_tokens", "cached_tokens", "reasoning_tokens"):
+        v = int(src.get(k) or 0)
+        if v > 0:
+            dst[k] = max(dst.get(k, 0), v)
+    return dst
+
+
 async def _tracked_stream(
     aiter: AsyncIterator[str], caller: str, model: str, endpoint: str = ""
 ) -> AsyncIterator[str]:
-    """Pass-through SSE generator that extracts usage from the final chunk."""
-    saw_usage = False
+    """Pass-through SSE generator that extracts usage from usage-bearing chunks.
+
+    Understands all three response dialects the proxy emits:
+      * OpenAI chat:      top-level ``usage`` on the final chunk
+      * Responses API:    ``response.usage`` inside ``response.completed``
+      * Anthropic Messages: ``message.usage`` (input) + Anthropic-shaped
+        top-level ``usage`` with ``input_tokens``/``output_tokens``
+
+    Token counts are accumulated across chunks, so dialects that split
+    input/output usage across events are recorded exactly once and fully.
+    A chunk merely *mentioning* "usage" (e.g. echoed model text) no longer
+    suppresses real usage capture.
+    """
     start = time.monotonic()
+    acc: dict = {}
+    recorded = False
     async for sse in aiter:
-        if '"usage"' in sse and not saw_usage:
+        if '"usage"' in sse and not recorded:
             try:
                 payload = sse.strip()
                 if payload.startswith("data: "):
@@ -494,14 +525,44 @@ async def _tracked_stream(
                 elif payload.startswith("data:"):
                     payload = payload[5:]
                 data = json.loads(payload)
-                u = _extract_usage(data.get("usage") or {})
-                USAGE.record(caller, model=model, endpoint=endpoint, duration_ms=(time.monotonic() - start) * 1000, **u)
-                saw_usage = True
+                raw = data.get("usage")
+                if not isinstance(raw, dict):
+                    rsp = data.get("response")
+                    raw = rsp.get("usage") if isinstance(rsp, dict) else None
+                if not isinstance(raw, dict):
+                    msg = data.get("message")
+                    raw = msg.get("usage") if isinstance(msg, dict) else None
+                cand = _extract_usage(raw) if isinstance(raw, dict) else {}
+                if isinstance(raw, dict) and not cand.get("completion_tokens"):
+                    # Anthropic dialect: input_tokens / output_tokens naming.
+                    cand["prompt_tokens"] = (
+                        cand.get("prompt_tokens") or _int_tokens(raw.get("input_tokens"))
+                    )
+                    cand["completion_tokens"] = (
+                        cand.get("completion_tokens") or _int_tokens(raw.get("output_tokens"))
+                    )
+                merged = _merge_usage(dict(acc), cand)
+                if merged != acc:
+                    acc = merged
+                    # Record as soon as completion tokens are known; the
+                    # fallback below covers streams that never carry them.
+                    if acc.get("completion_tokens"):
+                        USAGE.record(caller, model=model, endpoint=endpoint,
+                                     duration_ms=(time.monotonic() - start) * 1000, **acc)
+                        recorded = True
             except Exception:
                 pass
         yield sse
-    if not saw_usage:
-        USAGE.record(caller, model=model, endpoint=endpoint, duration_ms=(time.monotonic() - start) * 1000)
+    if not recorded:
+        USAGE.record(
+            caller, model=model, endpoint=endpoint,
+            duration_ms=(time.monotonic() - start) * 1000,
+            prompt_tokens=acc.get("prompt_tokens", 0),
+            completion_tokens=acc.get("completion_tokens", 0),
+            cached_tokens=acc.get("cached_tokens", 0),
+            reasoning_tokens=acc.get("reasoning_tokens", 0),
+        )
+
 
 
 async def _send_upstream(
@@ -519,8 +580,8 @@ async def _upstream_pooled(
 ) -> tuple[httpx.Response, str]:
     """Run `build(api_key)` once per pooled key until one attempt succeeds.
 
-    Keys come from KEY_POOL (round-robin when KEY_ROTATION is on). A
-    key-attributable upstream status (401/402/403/408/429/5xx when
+    The first key in priority order is preferred and reused until it fails;
+    a key-attributable upstream status (401/402/403/408/429/5xx when
     KEY_FAILOVER is on) or a network error transparently retries the next
     key; failed responses are closed before retrying. When every key is
     exhausted the last failing response is returned so callers render their

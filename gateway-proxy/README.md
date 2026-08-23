@@ -61,7 +61,7 @@ AI_GATEWAY_API_KEY=vck_your_key_here
 PROXY_API_KEY=your_proxy_key_here
 ```
 
-### Multiple gateway keys (round-robin + failover)
+### Multiple gateway keys (failover)
 
 The proxy supports several upstream gateway keys. List them in `.env`:
 
@@ -73,16 +73,22 @@ AI_GATEWAY_API_KEY_3=vck_third_key   # up to _20
 
 With more than one key configured:
 
-- **Round-robin** — requests alternate across keys (`KEY_ROTATION=1`, default on).
-- **Automatic failover** — if a key fails with `401/402/403/408/429`, any `5xx`,
-  or a network error, the request is transparently retried on the next key
-  (`KEY_FAILOVER=1`, default on). Request faults like `400` are not retried.
-- **Cooldown** — a failing key sits out of rotation for `KEY_COOLDOWN` seconds
-  (default 30, `0` disables) so a dead key stops costing latency.
+- **Sticky first key** — the first key in priority order is always preferred
+  and reused for every request until it fails; there is no round-robin
+  distribution across healthy keys.
+- **Automatic failover** — if the active key fails with `401/402/403/408/429`,
+  any `5xx`, or a network error, the request is transparently retried on the
+  next key (`KEY_FAILOVER=1`, default on). Request faults like `400` are not
+  retried.
+- **Cooldown** — a failing key sits out for `KEY_COOLDOWN` seconds (default
+  30, `0` disables) so a dead key stops costing latency.
+- **Background healer** (`KEY_HEALER=1`, default on) — probes cooling keys
+  with a cheap authenticated request and restores any that answer `200`
+  before their full cooldown elapses.
 
-All three switches are plain `.env` flags — set `0` to disable. `/healthz`
-reports the pool state (`keys.count`, `rotation`, `failover`, `cooling`) and
-startup logs each key's masked tail.
+All switches are plain `.env` flags — set `0` to disable. `/healthz`
+reports the pool state (`keys.count`, `failover`, `cooling`) and startup
+logs each key's masked tail.
 
 ## Run
 
@@ -299,8 +305,8 @@ A healthcheck hits `/healthz` every 30 seconds.
 ## Testing
 
 ```bash
-uv run pytest tests/                       # full suite (266 tests)
+uv run pytest tests/                       # full suite (297 tests)
 uv run pytest tests/test_anthropic.py -v   # Anthropic converter
-uv run pytest tests/test_keys.py -v        # key pool + round-robin + failover
+uv run pytest tests/test_keys.py -v        # key pool + failover + cooldown
 uv run pytest tests/test_streaming.py -v   # streaming conversion
 ```

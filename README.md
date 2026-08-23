@@ -197,10 +197,9 @@ All configuration is via environment variables (loaded from `.env`). See
 | Variable | Default | Description |
 |---|---|---|
 | `AI_GATEWAY_API_KEY` | *(empty)* | Your AI Gateway API key (required). At `~/.fx/api-key` if you use the fx CLI. Comma-separated list accepted. |
-| `AI_GATEWAY_API_KEY_1` .. `_20` | *(empty)* | Numbered keys for multi-key rotation. Override the legacy var on duplicates. |
-| `KEY_ROTATION` | `1` | Round-robin across keys when more than one is set (`0` = always use key 1). |
+| `AI_GATEWAY_API_KEY_1` .. `_20` | *(empty)* | Additional upstream keys for failover. Override the legacy var on duplicates. |
 | `KEY_FAILOVER` | `1` | On a key-attributable failure (401/402/403/408/429, any 5xx, or network error) transparently retry the next key. |
-| `KEY_COOLDOWN` | `30` | Seconds a failing key sits out of rotation (`0` disables). If all keys cooling, the coolest is still used. |
+| `KEY_COOLDOWN` | `30` | Seconds a failing key sits out (`0` disables). If all keys cooling, the coolest is still used. |
 
 ### Proxy auth & behavior
 
@@ -295,7 +294,7 @@ vercela/
     ├── main.py                        # Entrypoint stub (delegates to server)
     ├── server.py                      # FastAPI app + HTTP transport layer
     ├── identity.py                    # Live fx identity sync from GitHub
-    ├── keys.py                        # Multi-key pool (round-robin + failover)
+    ├── keys.py                        # Multi-key pool (failover + cooldown)
     ├── usage.py                       # In-memory usage tracking
     ├── test_proxy.py                  # Live smoke test (NOT a pytest)
     ├── converter/                     # Pure OpenAI ↔ v3 conversion package
@@ -356,13 +355,13 @@ upstream error normalization, and client-disconnect cancellation.
 | Module | Responsibility |
 |---|---|
 | `identity.py` | Background loop syncing fx identity (User-Agent + protocol header versions) from the vercel-labs/fx GitHub repo. Hot-swaps `identity.state` in memory. Falls back to local `fx` binary version, then hardcoded default. |
-| `keys.py` | `KeyPool`: multi-key round-robin + failover + cooldown for upstream gateway keys. Thread-safe. |
+| `keys.py` | `KeyPool`: multi-key failover + cooldown for upstream gateway keys. Thread-safe. |
 | `usage.py` | `UsageTracker`: in-memory per-caller request/error/token counters. Thread-safe. |
 | `main.py` | 7-line entrypoint stub delegating to `server.app`. |
 
 ### Features beyond plain forwarding
 
-- **Multi-key pool** — round-robin rotation, automatic failover on 401/402/403/408/429/5xx, and cooldown for dead keys
+- **Multi-key pool** — sticky first-key selection, automatic failover on 401/402/403/408/429/5xx, and cooldown for dead keys
 - **Live fx identity sync** — User-Agent and protocol headers auto-updated from the vercel-labs/fx GitHub repo
 - **Client-side tool-history validation** — clear `400` errors instead of opaque "Invalid input" gateway rejections
 - **Upstream error normalization** — gateway errors are reshaped to the OpenAI error format

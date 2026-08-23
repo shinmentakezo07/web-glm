@@ -160,7 +160,7 @@ Client request (any format)
     │
     ├─ 7. _v3_headers() — build fx-identity headers
     │
-    ├─ 8. _upstream_pooled() — send to gateway (with key rotation/failover)
+    ├─ 8. _upstream_pooled() — send to gateway (with key failover)
     │
     └─ 9. Response handling (see next section)
 ```
@@ -588,9 +588,9 @@ input".
   used by the Anthropic route. Hydrates images, builds v3 body, pooled send.
   Returns `(response, used_key)`.
 
-- `_upstream_pooled(build)` — Key pool wrapper. Tries keys in round-robin
-  order, retries on key-attributable failures (401/402/403/408/429/5xx),
-  applies cooldowns. Returns `(response, used_key)`.
+- `_upstream_pooled(build)` — Key pool wrapper. Prefers the first key in
+  priority order, retries on key-attributable failures
+  (401/402/403/408/429/5xx), applies cooldowns. Returns `(response, used_key)`.
 
 - `_chat_stream(resp, model, include_usage)` — Streaming generator that
   consumes the upstream v3 stream and yields OpenAI SSE chunks. Closes
@@ -657,12 +657,12 @@ Env knobs:
 
 `KeyPool` manages multiple gateway API keys:
 
-- **Round-robin**: Requests alternate across keys
-  (`KEY_ROTATION=1`, default on).
+- **Sticky first key**: The first key in priority order is always preferred
+  and reused for every request until it fails.
 - **Failover**: On a key-attributable error (401/402/403/408/429/5xx) or
   network error, transparently retries the next key
   (`KEY_FAILOVER=1`, default on). Request faults like 400 are not retried.
-- **Cooldown**: A failing key sits out of rotation for `KEY_COOLDOWN`
+- **Cooldown**: A failing key sits out for `KEY_COOLDOWN`
   seconds (default 30). If every key is cooling, the coolest is still
   handed out so the proxy degrades instead of dying.
 
@@ -945,9 +945,10 @@ AI_GATEWAY_API_KEY_1=vck_backup_1
 AI_GATEWAY_API_KEY_2=vck_backup_2   # up to _20
 ```
 
-**Round-robin** (`KEY_ROTATION=1`, default on):
-Requests alternate across keys. The internal index advances after each
-`next()` call.
+**Sticky first key** (default):
+The first key in priority order is always preferred and reused for every
+request until it fails. There is no round-robin distribution across
+healthy keys.
 
 **Failover** (`KEY_FAILOVER=1`, default on):
 On a key-attributable error (401/402/403/408/429/5xx) or network error,
@@ -956,7 +957,7 @@ the request is transparently retried on the next key. Request faults
 not the key.
 
 **Cooldown** (`KEY_COOLDOWN=30`, default 30 seconds):
-A failing key sits out of rotation for the cooldown period. If every key
+A failing key sits out for the cooldown period. If every key
 is cooling, the coolest one is still handed out so the proxy degrades
 gracefully instead of refusing all requests.
 
@@ -1057,7 +1058,7 @@ network traffic):
 | `test_anthropic.py` | 48 | Anthropic ↔ OpenAI conversion (request, response, streaming, thinking blocks, tool indices, async streaming, token counting, reasoning routing) |
 | `test_cli.py` | 2 | CLI module entry point |
 | `test_identity.py` | 5 | fx identity sync (version parsing, source parsing, apply) |
-| `test_keys.py` | 34 | Key pool (round-robin, failover, cooldown, masking, env loading) |
+| `test_keys.py` | 34 | Key pool (sticky selection, failover, cooldown, masking, env loading) |
 | `test_parts.py` | 18 | Low-level part shapes (content, tool calls, tool messages, tool_choice, response_format, images) |
 | `test_request.py` | 27 | openai_to_v3() full request assembly (messages, tools, params, reasoning, top_k, providerOptions) |
 | `test_response.py` | 13 | v3_to_openai() non-streaming response (text, tools, usage, reasoning content, reasoning tokens) |

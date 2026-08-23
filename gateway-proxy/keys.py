@@ -6,14 +6,17 @@ Keys come from the environment:
     AI_GATEWAY_API_KEY_1    numbered keys; _1 wins over the legacy var on
     AI_GATEWAY_API_KEY_2    duplicates, order is legacy -> _1 -> _2 -> ...
 
-Behaviour (all toggleable via .env):
+Behaviour (toggleable via .env):
 
-    KEY_ROTATION=1    hand keys out round-robin when more than one is set
     KEY_FAILOVER=1    on a key-attributable error (401/402/403/408/429/5xx)
                       or a network error, transparently retry the next key
-    KEY_COOLDOWN=30   seconds a failed key sits out of rotation (0 = off);
-                      if every key is cooling, the coolest is still handed
-                      out so the proxy degrades instead of dying
+    KEY_COOLDOWN=30   seconds a failed key sits out before being retried
+                      (0 = off); if every key is cooling, the coolest is
+                      still handed out so the proxy degrades instead of dying
+
+The first key in priority order is always preferred and reused for every
+request until it fails; only then does the next key take over. There is no
+round-robin distribution.
 """
 
 from __future__ import annotations
@@ -60,27 +63,26 @@ def load_keys() -> list[str]:
 
 
 class KeyPool:
-    """Round-robin key source with per-request failover and cooldowns.
+    """Sticky key source with per-request failover and cooldowns.
 
-    Thread-safe: route handlers run on the event loop, but the pool may
-    also be probed from health checks or tests on other threads.
+    The first key in priority order is always preferred and reused until it
+    fails; failover then moves to the next key. Thread-safe: route handlers
+    run on the event loop, but the pool may also be probed from health
+    checks or tests on other threads.
     """
 
     def __init__(
         self,
         keys: list[str],
         *,
-        rotation: bool | None = None,
         failover: bool | None = None,
         cooldown_seconds: float | None = None,
     ):
         self.keys = list(keys)
-        self.rotation = _env_flag("KEY_ROTATION") if rotation is None else rotation
         self.failover = _env_flag("KEY_FAILOVER") if failover is None else failover
         self.cooldown_seconds = (
             float(os.getenv("KEY_COOLDOWN", "30")) if cooldown_seconds is None else cooldown_seconds
         )
-        self._idx = 0
         self._lock = threading.Lock()
         self._cooldown_until: dict[str, float] = {}
         self._failures: dict[str, int] = {}
@@ -90,33 +92,24 @@ class KeyPool:
 
     def next(self, exclude: set[str] | frozenset[str] = frozenset()) -> str | None:
         """Pick the next key. `exclude` holds keys already tried for the
-        current request; returns None when every key is excluded."""
+        current request; returns None when every key is excluded.
+
+        The first available key in priority order is always preferred; only
+        cooling keys are skipped (and only while a non-cooling key remains).
+        """
         now = time.monotonic()
         with self._lock:
-            n = len(self.keys)
-            if n == 0:
-                return None
-            start = self._idx if self.rotation else 0
-            order = [(start + off) % n for off in range(n)]
-            pick = -1
-            # Pass 1: skip cooling keys. Pass 2: accept them (all cooling
-            # must not take the proxy down).
+            # Pass 1: prefer the first non-excluded, non-cooling key.
+            # Pass 2: if every candidate is cooling, accept the first
+            # non-excluded one so the proxy degrades instead of dying.
             for allow_cooling in (False, True):
-                for i in order:
-                    key = self.keys[i]
+                for key in self.keys:
                     if key in exclude:
                         continue
                     if not allow_cooling and self._cooldown_until.get(key, 0.0) > now:
                         continue
-                    pick = i
-                    break
-                if pick >= 0:
-                    break
-            if pick < 0:
-                return None
-            if self.rotation:
-                self._idx = (pick + 1) % n
-            return self.keys[pick]
+                    return key
+            return None
 
     def should_failover(self, status_code: int) -> bool:
         """True when this upstream status justifies retrying on another key."""
@@ -129,6 +122,16 @@ class KeyPool:
             if self.cooldown_seconds > 0:
                 self._cooldown_until[key] = time.monotonic() + self.cooldown_seconds
 
+    def cooling_keys(self) -> list[str]:
+        """Snapshot of keys currently serving a cooldown, in pool order.
+
+        The healer sweeps this list and restores healthy keys early via
+        report_success().
+        """
+        now = time.monotonic()
+        with self._lock:
+            return [k for k in self.keys if self._cooldown_until.get(k, 0.0) > now]
+
     def report_success(self, key: str) -> None:
         """A working key leaves cooldown immediately."""
         with self._lock:
@@ -140,7 +143,6 @@ class KeyPool:
         with self._lock:
             return {
                 "count": len(self.keys),
-                "rotation": self.rotation,
                 "failover": self.failover,
                 "cooldown_s": self.cooldown_seconds,
                 "cooling": sum(1 for until in self._cooldown_until.values() if until > now),

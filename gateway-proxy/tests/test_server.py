@@ -5,6 +5,7 @@ real network traffic is needed. The mock records the v3 request bodies, which
 lets us assert the wire format the proxy actually sends upstream.
 """
 
+import asyncio
 import json
 import os
 import tempfile
@@ -749,3 +750,96 @@ class TestTopK:
         assert resp.status_code == 200
         upstream = calls[0]["body"]
         assert upstream["topK"] == 40
+
+
+# --------------------------------------------------------------------------- #
+# _tracked_stream: usage extraction across response dialects
+# --------------------------------------------------------------------------- #
+
+
+class TestTrackedStream:
+    """_tracked_stream must capture real usage from every dialect and never
+    latch onto chunks that merely mention the word "usage"."""
+
+    def run(self, coro):
+        return asyncio.run(coro)
+
+    def _record(self, monkeypatch):
+        recorded: list[dict] = []
+
+        class FakeUsage:
+            def record(self, *args, **kwargs):
+                recorded.append(kwargs)
+
+        monkeypatch.setattr(server, "USAGE", FakeUsage())
+        return recorded
+
+    async def _collect(self, chunks, endpoint="/v1/chat/completions"):
+        async def aiter():
+            for c in chunks:
+                yield c
+
+        async for _ in server._tracked_stream(aiter(), "caller", "m", endpoint):
+            pass
+
+    def test_openai_final_usage_chunk(self, monkeypatch):
+        recorded = self._record(monkeypatch)
+        final = "data: " + json.dumps({
+            "choices": [{"delta": {}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        })
+        self.run(self._collect(['data: {"choices":[{"delta":{"content":"hi"}}]}', final]))
+        assert len(recorded) == 1
+        assert recorded[0]["prompt_tokens"] == 10
+        assert recorded[0]["completion_tokens"] == 5
+
+    def test_quoted_usage_in_content_does_not_suppress_real_usage(self, monkeypatch):
+        """Model echoing the literal text "usage" must not poison tracking."""
+        recorded = self._record(monkeypatch)
+        noisy = "data: " + json.dumps({
+            "choices": [{"delta": {"content": 'see "usage" docs'}}]
+        })
+        final = "data: " + json.dumps({
+            "choices": [{"delta": {}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 2},
+        })
+        self.run(self._collect([noisy, final]))
+        assert len(recorded) == 1
+        assert recorded[0]["prompt_tokens"] == 7
+        assert recorded[0]["completion_tokens"] == 2
+
+    def test_anthropic_split_usage_merged(self, monkeypatch):
+        """message_start carries input tokens; message_delta carries output."""
+        recorded = self._record(monkeypatch)
+        start_ev = "data: " + json.dumps({
+            "type": "message_start",
+            "message": {"id": "x", "usage": {"input_tokens": 3}},
+        })
+        delta_ev = "data: " + json.dumps({
+            "type": "message_delta",
+            "usage": {"output_tokens": 7},
+        })
+        self.run(self._collect([start_ev, delta_ev], endpoint="/v1/messages"))
+        assert len(recorded) == 1
+        assert recorded[0]["prompt_tokens"] == 3
+        assert recorded[0]["completion_tokens"] == 7
+
+    def test_responses_nested_usage(self, monkeypatch):
+        """Responses API nests usage under response.usage in completed event."""
+        recorded = self._record(monkeypatch)
+        ev = "data: " + json.dumps({
+            "type": "response.completed",
+            "response": {"usage": {"prompt_tokens": 9, "completion_tokens": 4}},
+        })
+        self.run(self._collect([ev], endpoint="/v1/responses"))
+        assert len(recorded) == 1
+        assert recorded[0]["prompt_tokens"] == 9
+        assert recorded[0]["completion_tokens"] == 4
+
+    def test_no_usage_anywhere_records_zero_once(self, monkeypatch):
+        recorded = self._record(monkeypatch)
+        self.run(self._collect(['data: {"choices":[{"delta":{"content":"hi"}}]}']))
+        assert len(recorded) == 1
+        assert recorded[0]["prompt_tokens"] == 0
+        assert recorded[0]["completion_tokens"] == 0
+

@@ -1,4 +1,4 @@
-"""Tests for the multi-key pool: loading, round-robin, failover, cooldown."""
+"""Tests for the multi-key pool: loading, sticky-key selection, failover, cooldown."""
 
 import json
 import os
@@ -64,48 +64,46 @@ class TestLoadKeys:
 # --------------------------------------------------------------------------- #
 
 
-class TestRoundRobin:
-    def test_cycles_in_order(self):
-        pool = KeyPool(["k1", "k2", "k3"], rotation=True, failover=True)
+class TestStickySelection:
+    def test_always_first_key_until_it_fails(self):
+        # The first key is preferred and reused for every request; there is
+        # no round-robin distribution across healthy keys.
+        pool = KeyPool(["k1", "k2", "k3"], failover=True)
         got = [pool.next() for _ in range(6)]
-        assert got == ["k1", "k2", "k3", "k1", "k2", "k3"]
+        assert got == ["k1"] * 6
 
     def test_single_key_stable(self):
-        pool = KeyPool(["only"], rotation=True, failover=True)
+        pool = KeyPool(["only"], failover=True)
         assert all(pool.next() == "only" for _ in range(3))
 
-    def test_rotation_off_always_first(self):
-        pool = KeyPool(["k1", "k2"], rotation=False, failover=False)
-        assert [pool.next() for _ in range(4)] == ["k1"] * 4
-
     def test_empty_pool_returns_none(self):
-        assert KeyPool([], rotation=True).next() is None
+        assert KeyPool([]).next() is None
 
     def test_exclude_skips_tried_keys(self):
-        pool = KeyPool(["k1", "k2"], rotation=False, failover=False)
+        pool = KeyPool(["k1", "k2"], failover=False)
         assert pool.next(exclude={"k1"}) == "k2"
         assert pool.next(exclude={"k1", "k2"}) is None
 
 
 class TestFailoverPolicy:
     def test_key_attributable_statuses(self):
-        pool = KeyPool(["k1"], rotation=True, failover=True)
+        pool = KeyPool(["k1"], failover=True)
         for status in (401, 402, 403, 408, 429, 500, 502, 503, 504):
             assert pool.should_failover(status), status
 
     def test_request_faults_do_not_failover(self):
-        pool = KeyPool(["k1"], rotation=True, failover=True)
+        pool = KeyPool(["k1"], failover=True)
         for status in (400, 404, 413, 422):
             assert not pool.should_failover(status), status
 
     def test_failover_disabled(self):
-        pool = KeyPool(["k1"], rotation=True, failover=False)
+        pool = KeyPool(["k1"], failover=False)
         assert not pool.should_failover(429)
 
 
 class TestCooldown:
     def test_failed_key_sits_out_then_recovers(self):
-        pool = KeyPool(["k1", "k2"], rotation=True, failover=True, cooldown_seconds=60.0)
+        pool = KeyPool(["k1", "k2"], failover=True, cooldown_seconds=60.0)
         assert pool.next() == "k1"
         pool.report_failure("k1")
         # k1 cooling -> next picks k2, then k2 again (k1 still cooling)...
@@ -117,11 +115,39 @@ class TestCooldown:
         assert pool.next(exclude={"k2"}) == "k1"
 
     def test_cooldown_zero_disables(self):
-        pool = KeyPool(["k1", "k2"], rotation=True, failover=True, cooldown_seconds=0.0)
+        pool = KeyPool(["k1", "k2"], failover=True, cooldown_seconds=0.0)
         assert pool.next() == "k1"
         pool.report_failure("k1")
-        assert pool.next() == "k2"
+        # cooldown disabled -> k1 is not skipped, stays the preferred key
         assert pool.next() == "k1"
+
+
+class TestCoolingKeys:
+    def test_fresh_pool_has_none(self):
+        pool = KeyPool(["k1", "k2"], cooldown_seconds=60.0)
+        assert pool.cooling_keys() == []
+
+    def test_failed_key_is_listed(self):
+        pool = KeyPool(["k1", "k2"], cooldown_seconds=60.0)
+        pool.report_failure("k2")
+        assert pool.cooling_keys() == ["k2"]
+
+    def test_success_clears_entry(self):
+        pool = KeyPool(["k1"], cooldown_seconds=60.0)
+        pool.report_failure("k1")
+        pool.report_success("k1")
+        assert pool.cooling_keys() == []
+
+    def test_zero_cooldown_never_lists(self):
+        pool = KeyPool(["k1"], cooldown_seconds=0.0)
+        pool.report_failure("k1")
+        assert pool.cooling_keys() == []
+
+    def test_lists_follow_pool_order(self):
+        pool = KeyPool(["a", "b", "c"], cooldown_seconds=60.0)
+        pool.report_failure("c")
+        pool.report_failure("a")
+        assert pool.cooling_keys() == ["a", "c"]
 
 
 # --------------------------------------------------------------------------- #
@@ -184,7 +210,7 @@ class TestChatFailover:
     def test_fails_over_to_second_key(self, status):
         calls: list[dict] = []
         router = RecordingRouter(calls, fail_status=status, fail_auth=KEY1)
-        pool = KeyPool([KEY1, KEY2], rotation=True, failover=True, cooldown_seconds=0.0)
+        pool = KeyPool([KEY1, KEY2], failover=True, cooldown_seconds=0.0)
         with setup(calls, pool, router) as client:
             resp = client.post("/v1/chat/completions", headers=AUTH_HEADERS, json=CHAT_BODY)
         assert resp.status_code == 200
@@ -196,7 +222,7 @@ class TestChatFailover:
     def test_no_failover_on_bad_request(self):
         calls: list[dict] = []
         router = RecordingRouter(calls, fail_status=400, fail_auth=KEY1)
-        pool = KeyPool([KEY1, KEY2], rotation=True, failover=True, cooldown_seconds=0.0)
+        pool = KeyPool([KEY1, KEY2], failover=True, cooldown_seconds=0.0)
         with setup(calls, pool, router) as client:
             resp = client.post("/v1/chat/completions", headers=AUTH_HEADERS, json=CHAT_BODY)
         assert resp.status_code == 400
@@ -205,31 +231,28 @@ class TestChatFailover:
     def test_failover_disabled_by_flag(self):
         calls: list[dict] = []
         router = RecordingRouter(calls, fail_status=429, fail_auth=KEY1)
-        pool = KeyPool([KEY1, KEY2], rotation=True, failover=False, cooldown_seconds=0.0)
+        pool = KeyPool([KEY1, KEY2], failover=False, cooldown_seconds=0.0)
         with setup(calls, pool, router) as client:
             resp = client.post("/v1/chat/completions", headers=AUTH_HEADERS, json=CHAT_BODY)
         assert resp.status_code == 429
         assert len(calls) == 1
 
-    def test_round_robin_alternates_across_requests(self):
+    def test_sticky_key_reused_across_requests(self):
+        # With no failures the first key is reused for every request;
+        # there is no round-robin alternation between healthy keys.
         calls: list[dict] = []
         router = RecordingRouter(calls, fail_status=None, fail_auth=None)
-        pool = KeyPool([KEY1, KEY2], rotation=True, failover=True, cooldown_seconds=0.0)
+        pool = KeyPool([KEY1, KEY2], failover=True, cooldown_seconds=0.0)
         with setup(calls, pool, router) as client:
             for _ in range(4):
                 resp = client.post("/v1/chat/completions", headers=AUTH_HEADERS, json=CHAT_BODY)
                 assert resp.status_code == 200
-        assert [c["auth"] for c in calls] == [
-            f"Bearer {KEY1}",
-            f"Bearer {KEY2}",
-            f"Bearer {KEY1}",
-            f"Bearer {KEY2}",
-        ]
+        assert [c["auth"] for c in calls] == [f"Bearer {KEY1}"] * 4
 
     def test_streaming_failover_before_first_chunk(self):
         calls: list[dict] = []
         router = RecordingRouter(calls, fail_status=402, fail_auth=KEY1)
-        pool = KeyPool([KEY1, KEY2], rotation=True, failover=True, cooldown_seconds=0.0)
+        pool = KeyPool([KEY1, KEY2], failover=True, cooldown_seconds=0.0)
         body = dict(CHAT_BODY, stream=True)
         with setup(calls, pool, router) as client:
             resp = client.post("/v1/chat/completions", headers=AUTH_HEADERS, json=body)
@@ -242,7 +265,7 @@ class TestChatFailover:
         router = RecordingRouter(calls, fail_status=429, fail_auth="ANY")
         # make every key fail regardless of which one is used
         router.fail_auth = None
-        pool = KeyPool([KEY1, KEY2], rotation=True, failover=True, cooldown_seconds=0.0)
+        pool = KeyPool([KEY1, KEY2], failover=True, cooldown_seconds=0.0)
 
         def always_fail(request: httpx.Request) -> httpx.Response:
             calls.append({"path": request.url.path})
@@ -273,7 +296,7 @@ class TestOtherRoutesFailover:
                 return httpx.Response(401, json={"error": {"message": "bad key"}})
             return httpx.Response(200, json={"data": [{"id": "m1"}]})
 
-        pool = KeyPool([KEY1, KEY2], rotation=True, failover=True, cooldown_seconds=0.0)
+        pool = KeyPool([KEY1, KEY2], failover=True, cooldown_seconds=0.0)
         server.KEY_POOL = pool
         server.app.state.client = httpx.AsyncClient(
             transport=httpx.MockTransport(handler), timeout=httpx.Timeout(5.0)
@@ -294,7 +317,7 @@ class TestOtherRoutesFailover:
                 return httpx.Response(429, json={"error": {"message": "slow down"}})
             return httpx.Response(200, json={"data": [{"embedding": [0.1]}]})
 
-        pool = KeyPool([KEY1, KEY2], rotation=True, failover=True, cooldown_seconds=0.0)
+        pool = KeyPool([KEY1, KEY2], failover=True, cooldown_seconds=0.0)
         server.KEY_POOL = pool
         server.app.state.client = httpx.AsyncClient(
             transport=httpx.MockTransport(handler), timeout=httpx.Timeout(5.0)
@@ -312,7 +335,7 @@ class TestOtherRoutesFailover:
 
 class TestHealthReportsPool:
     def test_healthz_lists_key_count(self):
-        pool = KeyPool([KEY1, KEY2], rotation=True, failover=True, cooldown_seconds=30.0)
+        pool = KeyPool([KEY1, KEY2], failover=True, cooldown_seconds=30.0)
         server.KEY_POOL = pool
         server.app.state.client = httpx.AsyncClient(timeout=httpx.Timeout(5.0))
         server.app.state.models_cache = {"data": None, "expires": 0.0}
@@ -321,7 +344,7 @@ class TestHealthReportsPool:
         assert resp.status_code == 200
         data = resp.json()
         assert data["keys"]["count"] == 2
-        assert data["keys"]["rotation"] is True
         assert data["keys"]["failover"] is True
+        assert "rotation" not in data["keys"]
         # never leak raw keys through health
         assert KEY1 not in json.dumps(data)

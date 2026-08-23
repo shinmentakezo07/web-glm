@@ -16,7 +16,7 @@ gateway-proxy/
 │   └── validation.py    #   tool-history pairing checks
 ├── server.py           # FastAPI app + HTTP transport (routes, auth, key pool)
 ├── identity.py         # Background fx identity sync from GitHub
-├── keys.py             # KeyPool: round-robin + failover + cooldown
+├── keys.py             # KeyPool: failover + cooldown
 ├── usage.py            # In-memory per-caller usage tracking
 ├── main.py             # Entrypoint stub (delegates to server.app)
 ├── tests/              # pytest unit tests (mirror converter/ layout)
