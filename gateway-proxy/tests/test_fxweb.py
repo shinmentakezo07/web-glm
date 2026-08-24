@@ -176,6 +176,8 @@ def _make_router(calls: list[dict], fxweb_succeeds: bool = True):
 
 def _setup(calls: list[dict], *, fxweb_succeeds=True, pool_keys=None):
     server.USAGE.enabled = False
+    # Reset fx.sh cooldown so tests don't leak state between each other.
+    server._fxweb_cooldown_until = 0.0
     if pool_keys is not None:
         server.KEY_POOL = server.KeyPool(pool_keys)
     server.app.state.client = httpx.AsyncClient(
@@ -421,3 +423,73 @@ class TestFxwebHealthz:
         assert "fxweb_fallback" in body
         assert body["fxweb_fallback"]["enabled"] is True
         assert body["fxweb_fallback"]["base_url"] == "https://fx.sh"
+        assert "cooling" in body["fxweb_fallback"]
+
+
+class TestFxwebCooldown:
+    """When fx.sh returns 429 (demo rate limit), the fallback is put on
+    cooldown so subsequent requests skip fx.sh entirely instead of
+    wasting time hitting a rate-limited endpoint."""
+
+    def setup_method(self):
+        server._fxweb_cooldown_until = 0.0
+
+    def teardown_method(self):
+        server._fxweb_cooldown_until = 0.0
+
+    def test_429_triggers_cooldown(self):
+        """A 429 from fx.sh sets the cooldown timestamp."""
+        server.KEY_POOL = server.KeyPool([])
+        calls: list[dict] = []
+        with _setup(calls, fxweb_succeeds=False) as client:
+            resp = client.post(
+                "/v1/chat/completions", headers=AUTH_HEADERS, json=V3_CHAT_BODY,
+            )
+        assert resp.status_code == 429
+        assert server._fxweb_is_cooling()
+
+    def test_cooldown_skips_fxweb(self):
+        """When on cooldown, the fx.sh fallback is not tried."""
+        server.KEY_POOL = server.KeyPool([])
+        calls: list[dict] = []
+        with _setup(calls) as client:
+            server._fxweb_cooldown_until = float("inf")  # permanent cooldown
+            resp = client.post(
+                "/v1/chat/completions", headers=AUTH_HEADERS, json=V3_CHAT_BODY,
+            )
+        server._fxweb_cooldown_until = 0.0
+        # fx.sh was NOT called (cooldown active)
+        paths = [c["path"] for c in calls]
+        assert "/fx-wasm/gateway/v3/ai/language-model" not in paths
+
+    def test_second_request_after_429_skips_fxweb(self):
+        """After a 429, the next request should NOT hit fx.sh."""
+        server.KEY_POOL = server.KeyPool([])
+        calls: list[dict] = []
+        with _setup(calls, fxweb_succeeds=False) as client:
+            # First request: hits fx.sh, gets 429, sets cooldown
+            client.post("/v1/chat/completions", headers=AUTH_HEADERS, json=V3_CHAT_BODY)
+            first_fxweb_hits = sum(1 for c in calls if "fx-wasm" in c["path"])
+            # Second request: should skip fx.sh (cooldown active)
+            client.post("/v1/chat/completions", headers=AUTH_HEADERS, json=V3_CHAT_BODY)
+            second_fxweb_hits = sum(1 for c in calls if "fx-wasm" in c["path"])
+        assert first_fxweb_hits == 1, "first request should hit fx.sh once"
+        assert second_fxweb_hits == 1, "second request should NOT add fx.sh hits"
+
+    def test_cooldown_can_be_disabled(self):
+        """FXWEB_COOLDOWN=0 means no cooldown (always try fx.sh)."""
+        original = server.FXWEB_COOLDOWN
+        server.FXWEB_COOLDOWN = 0
+        server.KEY_POOL = server.KeyPool([])
+        calls: list[dict] = []
+        try:
+            with _setup(calls, fxweb_succeeds=False) as client:
+                client.post("/v1/chat/completions", headers=AUTH_HEADERS, json=V3_CHAT_BODY)
+                assert not server._fxweb_is_cooling()
+                client.post("/v1/chat/completions", headers=AUTH_HEADERS, json=V3_CHAT_BODY)
+        finally:
+            server.FXWEB_COOLDOWN = original
+            server._fxweb_cooldown_until = 0.0
+        # Both requests hit fx.sh (no cooldown)
+        fxweb_hits = sum(1 for c in calls if "fx-wasm" in c["path"])
+        assert fxweb_hits == 2

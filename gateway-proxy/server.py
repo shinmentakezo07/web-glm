@@ -127,6 +127,12 @@ FXWEB_V3_CHAT = os.getenv(
 # ``let l = "fx-demo-proxy"``). This is NOT a secret — it is the public
 # free-tier key baked into the fx.sh /try page.
 FXWEB_API_KEY = os.getenv("FXWEB_API_KEY", "fx-demo-proxy")
+# When fx.sh returns 429 (demo rate limit: 10 prompts/day per key), the
+# fallback is put on a cooldown so subsequent requests skip fx.sh and go
+# straight to the Vercel gateway (or fail fast). Default 3600s = 1 hour.
+# Set FXWEB_COOLDOWN=0 to disable (every request will try fx.sh, even after
+# a 429).
+FXWEB_COOLDOWN = float(os.getenv("FXWEB_COOLDOWN", "3600"))
 # A plausible desktop Chrome User-Agent. The fx.sh gateway is browser-served,
 # so the HTTP-level User-Agent should look like a real browser rather than
 # fx/<version> (which lives in the body-level headers.user-agent instead).
@@ -348,6 +354,25 @@ def _generate_fxweb_session() -> tuple[str, str]:
     nonce = secrets.token_hex(8)  # 16 hex chars
     sid = f"{now_ms}-{now_ms * 1000000}-{nonce}"
     return sid, sid
+
+
+# Cooldown state for the fx.sh fallback. When fx.sh returns 429 (demo rate
+# limit: 10 prompts/day), we set this timestamp; subsequent requests skip
+# fx.sh until the cooldown expires, so we don't waste time hitting a
+# rate-limited endpoint.
+_fxweb_cooldown_until: float = 0.0
+
+
+def _fxweb_is_cooling() -> bool:
+    """True when the fx.sh fallback is on 429 cooldown."""
+    return FXWEB_COOLDOWN > 0 and time.monotonic() < _fxweb_cooldown_until
+
+
+def _fxweb_set_cooldown() -> None:
+    """Put the fx.sh fallback on cooldown after a 429."""
+    global _fxweb_cooldown_until
+    _fxweb_cooldown_until = time.monotonic() + FXWEB_COOLDOWN
+    log.warning("fx.sh fallback on %.0fs cooldown (rate limited)", FXWEB_COOLDOWN)
 
 
 # --------------------------------------------------------------------------- #
@@ -797,7 +822,7 @@ async def _upstream_pooled(
     # All Vercel keys exhausted (or none configured). Try the fx.sh free
     # web-gateway fallback before giving up, so free-tier callers without a
     # gateway key still reach the model.
-    if fxweb_build is not None and FXWEB_FALLBACK:
+    if fxweb_build is not None and FXWEB_FALLBACK and not _fxweb_is_cooling():
         # Close the last failed Vercel response before falling through.
         if last_resp is not None:
             await last_resp.aclose()
@@ -812,7 +837,12 @@ async def _upstream_pooled(
         if resp.status_code == 200:
             log.info("served via fx.sh free web-gateway fallback")
             return resp, "fxweb"
-        # fx.sh also failed — return its error response.
+        # fx.sh returned an error. If it's a 429 (demo rate limit), put
+        # the fallback on a long cooldown so we don't keep hitting a
+        # rate-limited endpoint. The limit is 10 prompts/day per the
+        # fx-demo-proxy key, tracked server-side (not per session/IP).
+        if resp.status_code == 429:
+            _fxweb_set_cooldown()
         log.warning("fx.sh fallback -> HTTP %d", resp.status_code)
         return resp, "fxweb"
     if last_resp is not None:
@@ -942,6 +972,7 @@ async def healthz():
             "enabled": FXWEB_FALLBACK,
             "base_url": FXWEB_BASE_URL,
             "endpoint": FXWEB_V3_CHAT,
+            "cooling": _fxweb_is_cooling(),
         },
     }
 
