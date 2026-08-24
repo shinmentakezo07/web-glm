@@ -282,7 +282,15 @@ class TestChatFailover:
         finally:
             pass
         assert resp.status_code == 429
-        assert len(calls) == 2, "both keys tried exactly once"
+        # Both Vercel keys are tried, then the fx.sh free-gateway fallback
+        # (when enabled) makes one more unauthenticated attempt.
+        if server.FXWEB_FALLBACK:
+            assert len(calls) == 3, "both keys tried, then fx.sh fallback"
+            assert calls[0]["path"] == "/v3/ai/language-model"
+            assert calls[1]["path"] == "/v3/ai/language-model"
+            assert calls[2]["path"] == "/fx-wasm/gateway/v3/ai/language-model"
+        else:
+            assert len(calls) == 2, "both keys tried exactly once"
 
 
 class TestOtherRoutesFailover:

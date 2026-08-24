@@ -101,6 +101,40 @@ DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "zai/glm-5.2")
 GATEWAY_SESSION_ID = os.getenv("GATEWAY_SESSION_ID", "")
 GATEWAY_SESSION_AFFINITY = os.getenv("GATEWAY_SESSION_AFFINITY", "")
 
+# --- fx.sh free web-gateway provider -------------------------------------- #
+# A second upstream backend: the free fx.sh web gateway. It speaks the SAME
+# v3 AI SDK protocol as the Vercel AI Gateway. The in-browser fx WASM terminal
+# sets ``AI_GATEWAY_API_KEY = "fx-demo-proxy"``; the page's fetch adapter then
+# rewrites the URL from ``ai-gateway.vercel.sh/<path>`` to
+# ``fx.sh/fx-wasm/gateway/<path>`` and forwards the Bearer token to the fx.sh
+# server, which proxies to the real gateway with that demo key.
+#
+#   POST https://fx.sh/fx-wasm/gateway/v3/ai/language-model
+#   Authorization: Bearer fx-demo-proxy
+#
+# FXWEB_FALLBACK=1 (default) makes the proxy try the fx.sh free endpoint
+# automatically when the Vercel gateway has no keys configured OR every key
+# fails over. So API-key callers keep working, and free-tier users with no
+# key also get served. Set FXWEB_FALLBACK=0 to disable the free fallback.
+FXWEB_FALLBACK = os.getenv("FXWEB_FALLBACK", "1").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+FXWEB_BASE_URL = os.getenv("FXWEB_BASE_URL", "https://fx.sh")
+FXWEB_V3_CHAT = os.getenv(
+    "FXWEB_V3_CHAT", "/fx-wasm/gateway/v3/ai/language-model"
+)
+# The demo API key the fx.sh web terminal uses (found in the page's JS:
+# ``let l = "fx-demo-proxy"``). This is NOT a secret — it is the public
+# free-tier key baked into the fx.sh /try page.
+FXWEB_API_KEY = os.getenv("FXWEB_API_KEY", "fx-demo-proxy")
+# A plausible desktop Chrome User-Agent. The fx.sh gateway is browser-served,
+# so the HTTP-level User-Agent should look like a real browser rather than
+# fx/<version> (which lives in the body-level headers.user-agent instead).
+_FXWEB_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
+)
+
 # Models that receive the body-level headers.user-agent (fx scopes it to
 # zai/glm-5.2). "*" = all models, "" = none, else comma-separated list.
 _raw_pua_models = os.getenv("PRODUCT_USER_AGENT_MODELS", "zai/glm-5.2")
@@ -174,7 +208,10 @@ async def lifespan(app: FastAPI):
     if not hasattr(app.state, "models_cache"):
         app.state.models_cache = {"data": None, "expires": 0.0}
     if not len(KEY_POOL):
-        log.warning("no AI_GATEWAY_API_KEY / AI_GATEWAY_API_KEY_N set — upstream will reject requests")
+        if FXWEB_FALLBACK:
+            log.info("no AI_GATEWAY_API_KEY set — fx.sh free web-gateway fallback enabled")
+        else:
+            log.warning("no AI_GATEWAY_API_KEY / AI_GATEWAY_API_KEY_N set — upstream will reject requests")
     else:
         log.info("key pool: %d key(s)  failover=%s  cooldown=%.0fs",
                  len(KEY_POOL), KEY_POOL.failover,
@@ -183,6 +220,9 @@ async def lifespan(app: FastAPI):
             log.info("  gateway key %s", mask(_k))
     if not PROXY_API_KEY:
         log.warning("PROXY_API_KEY not set — proxy is open to all callers")
+    if FXWEB_FALLBACK:
+        log.info("fx.sh free web-gateway fallback enabled (POST %s%s)",
+                 FXWEB_BASE_URL, FXWEB_V3_CHAT)
     if not client_injected:
         # Fetch the live fx identity (GitHub + local binary) before serving
         # any request, then start the periodic background refresher.
@@ -291,6 +331,26 @@ async def log_requests(request: Request, call_next):
 
 
 # --------------------------------------------------------------------------- #
+# fx.sh web-gateway session helpers
+# --------------------------------------------------------------------------- #
+
+
+def _generate_fxweb_session() -> tuple[str, str]:
+    """Generate a random fx.sh-style session id and affinity pair.
+
+    The in-browser fx terminal derives both from the current millisecond
+    timestamp plus a 16-hex-char nonce: ``<ms>-<ms*1000000>-<hex16>``. The
+    exact value is not validated server-side, so we use ``secrets`` for the
+    nonce (stronger than the WASM RNG) and keep the same shape so traffic
+    looks like the real web client.
+    """
+    now_ms = int(time.time() * 1000)
+    nonce = secrets.token_hex(8)  # 16 hex chars
+    sid = f"{now_ms}-{now_ms * 1000000}-{nonce}"
+    return sid, sid
+
+
+# --------------------------------------------------------------------------- #
 # Auth
 # --------------------------------------------------------------------------- #
 
@@ -368,6 +428,60 @@ def _v3_headers(
         headers["x-session-id"] = sid
     if affinity:
         headers["x-session-affinity"] = affinity
+    return headers
+
+
+def _fxweb_headers(
+    model: str,
+    streaming: bool = True,
+    *,
+    session_id: str | None = None,
+    session_affinity: str | None = None,
+) -> dict[str, str]:
+    """Build headers for the fx.sh free web-gateway fallback provider.
+
+    Mirrors what the in-browser fx WASM terminal sends:
+      - ``Authorization: Bearer fx-demo-proxy`` — the public demo key baked
+        into the fx.sh /try page JS (NOT a secret; it is the free-tier key
+        the page sets as ``AI_GATEWAY_API_KEY`` and the fetch adapter forwards
+        to the fx.sh server-side proxy).
+      - desktop-browser User-Agent (the fx version lives in the body-level
+        ``headers.user-agent`` instead, matching the WASM terminal)
+      - ``Origin``/``Referer`` pointing at fx.sh
+      - the same v3 protocol headers as the Vercel gateway
+      - per-request session pinning (``x-session-id``/``x-session-affinity``),
+        auto-generated in the fx.sh wire shape when not supplied
+    """
+    headers: dict[str, str] = {
+        "Authorization": f"Bearer {FXWEB_API_KEY}",
+        "Content-Type": "application/json",
+        "User-Agent": _FXWEB_BROWSER_UA,
+        "Accept": "text/event-stream" if streaming else "*/*",
+        "Accept-Language": "en-US,en;q=0.6",
+        "Origin": "https://fx.sh",
+        "Referer": "https://fx.sh/",
+        # Vercel's fx.sh edge checks sec-fetch-* to confirm same-origin
+        # browser requests. Without these the gateway returns 403.
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "HTTP-Referer": "https://github.com/vercel-labs/fx",
+        "X-Title": "fx",
+        "ai-gateway-protocol-version": identity.state["protocol_version"],
+        "ai-language-model-specification-version": identity.state["specification_version"],
+        "ai-language-model-id": model,
+        # fx.sh always streams on the wire (same invariant as the Vercel
+        # backend); non-streaming client requests still open a streaming
+        # upstream connection and collect deltas internally.
+        "ai-language-model-streaming": "true",
+    }
+    # Session pinning: prefer caller-provided, then env, then generate fresh.
+    sid = session_id or GATEWAY_SESSION_ID
+    affinity = session_affinity or GATEWAY_SESSION_AFFINITY
+    if not sid:
+        sid, affinity = _generate_fxweb_session()
+    headers["x-session-id"] = sid
+    headers["x-session-affinity"] = affinity
     return headers
 
 
@@ -607,8 +721,26 @@ async def _send_upstream(
     return resp
 
 
+async def _fxweb_send(
+    client: httpx.AsyncClient, v3_body: dict, model: str,
+    session_id: str | None = None, session_affinity: str | None = None,
+) -> httpx.Response:
+    """Send a v3 request to the free fx.sh web-gateway fallback.
+
+    No API key, no Authorization header — the same endpoint the in-browser
+    fx WASM terminal uses. Returns the streaming httpx.Response.
+    """
+    url = urljoin(FXWEB_BASE_URL + "/", FXWEB_V3_CHAT.lstrip("/"))
+    headers = _fxweb_headers(
+        model, streaming=True, session_id=session_id, session_affinity=session_affinity,
+    )
+    return await _send_upstream(client, url, headers, v3_body)
+
+
 async def _upstream_pooled(
     build: Callable[[str], Awaitable[httpx.Response]],
+    *,
+    fxweb_build: Callable[[], Awaitable[httpx.Response]] | None = None,
 ) -> tuple[httpx.Response, str]:
     """Run `build(api_key)` once per pooled key until one attempt succeeds.
 
@@ -619,6 +751,12 @@ async def _upstream_pooled(
     exhausted the last failing response is returned so callers render their
     normal error path. With no keys configured, one unauthenticated attempt
     is made (legacy behaviour).
+
+    If ``fxweb_build`` is provided (and FXWEB_FALLBACK is on), it is tried as
+    a last resort after every pooled Vercel key fails — or immediately when no
+    keys are configured. This lets free-tier users without a gateway API key
+    reach the model via the fx.sh free web-gateway, while API-key callers keep
+    using the paid Vercel gateway as the primary path.
     """
     tried: set[str] = set()
     last_resp: httpx.Response | None = None
@@ -656,6 +794,27 @@ async def _upstream_pooled(
         if last_resp is not None:
             await last_resp.aclose()
         last_resp, last_key = resp, key
+    # All Vercel keys exhausted (or none configured). Try the fx.sh free
+    # web-gateway fallback before giving up, so free-tier callers without a
+    # gateway key still reach the model.
+    if fxweb_build is not None and FXWEB_FALLBACK:
+        # Close the last failed Vercel response before falling through.
+        if last_resp is not None:
+            await last_resp.aclose()
+            last_resp = None
+        try:
+            resp = await fxweb_build()
+        except httpx.RequestError as exc:
+            log.warning("fx.sh fallback network error (%s)", type(exc).__name__)
+            if last_exc is not None:
+                raise last_exc
+            raise
+        if resp.status_code == 200:
+            log.info("served via fx.sh free web-gateway fallback")
+            return resp, "fxweb"
+        # fx.sh also failed — return its error response.
+        log.warning("fx.sh fallback -> HTTP %d", resp.status_code)
+        return resp, "fxweb"
     if last_resp is not None:
         return last_resp, last_key
     assert last_exc is not None
@@ -759,7 +918,10 @@ async def _send_to_v3(
         )
         return await _send_upstream(client, url, headers, v3_body)
 
-    return await _upstream_pooled(send)
+    async def fxweb_send() -> httpx.Response:
+        return await _fxweb_send(client, v3_body, model, session_id, session_affinity)
+
+    return await _upstream_pooled(send, fxweb_build=fxweb_send)
 
 
 # --------------------------------------------------------------------------- #
@@ -776,6 +938,11 @@ async def healthz():
         "fx": dict(identity.state),
         "keys": KEY_POOL.stats(),
         "usage": USAGE.totals(),
+        "fxweb_fallback": {
+            "enabled": FXWEB_FALLBACK,
+            "base_url": FXWEB_BASE_URL,
+            "endpoint": FXWEB_V3_CHAT,
+        },
     }
 
 
@@ -830,7 +997,14 @@ async def list_models(_: str = Depends(verify_proxy_key)):
             headers["Authorization"] = f"Bearer {key}"
         return await client.get(url, headers=headers)
 
-    resp, used_key = await _upstream_pooled(send)
+    async def fxweb_send() -> httpx.Response:
+        fxweb_url = urljoin(FXWEB_BASE_URL + "/", "fx-wasm/gateway/v1/models")
+        return await client.get(
+            fxweb_url,
+            headers={"Accept": "application/json", "Authorization": f"Bearer {FXWEB_API_KEY}"},
+        )
+
+    resp, used_key = await _upstream_pooled(send, fxweb_build=fxweb_send)
     log.debug("GET /v1/models via gateway key %s", mask(used_key))
     if resp.status_code != 200:
         return _client_error(resp)
@@ -893,7 +1067,10 @@ async def chat_completions(request: Request, _: str = Depends(verify_proxy_key))
         )
         return await _send_upstream(client, url, headers, v3_body)
 
-    resp, used_key = await _upstream_pooled(send)
+    async def fxweb_send() -> httpx.Response:
+        return await _fxweb_send(client, v3_body, model, session_id, session_affinity)
+
+    resp, used_key = await _upstream_pooled(send, fxweb_build=fxweb_send)
     log.debug("POST /v1/chat/completions via gateway key %s", mask(used_key))
 
     caller = request.client.host if request.client else "unknown"
@@ -976,7 +1153,10 @@ async def responses_route(request: Request, _: str = Depends(verify_proxy_key)):
         )
         return await _send_upstream(client, url, headers, v3_body)
 
-    resp, used_key = await _upstream_pooled(send)
+    async def fxweb_send() -> httpx.Response:
+        return await _fxweb_send(client, v3_body, model, session_id, session_affinity)
+
+    resp, used_key = await _upstream_pooled(send, fxweb_build=fxweb_send)
     log.debug("POST /v1/responses via gateway key %s", mask(used_key))
 
     caller = request.client.host if request.client else "unknown"

@@ -17,3 +17,5 @@ proxy.log
 
 # SQLite usage database
 usage.db
+usage.db-shm
+usage.db-wal
