@@ -787,38 +787,46 @@ async def _upstream_pooled(
     last_resp: httpx.Response | None = None
     last_key = ""
     last_exc: Exception | None = None
-    while True:
-        key = KEY_POOL.next(exclude=tried)
-        if key is None:
-            if tried or len(KEY_POOL):
-                break
-            key = ""  # no keys configured: single legacy attempt
-        tried.add(key)
-        try:
-            resp = await build(key)
-        except httpx.RequestError as exc:
-            last_exc, last_key = exc, key
+    # When no Vercel keys are configured AND the fx.sh fallback is
+    # available, skip the pointless unauthenticated Vercel attempt
+    # entirely — go straight to fx.sh.
+    has_keys = len(KEY_POOL) > 0
+    skip_vercel = (
+        not has_keys
+        and fxweb_build is not None
+        and FXWEB_FALLBACK
+        and not _fxweb_is_cooling()
+    )
+    if not skip_vercel:
+        while True:
+            key = KEY_POOL.next(exclude=tried)
+            if key is None:
+                if tried or len(KEY_POOL):
+                    break
+                key = ""  # no keys configured: single legacy attempt
+            tried.add(key)
+            try:
+                resp = await build(key)
+            except httpx.RequestError as exc:
+                last_exc, last_key = exc, key
+                KEY_POOL.report_failure(key)
+                log.warning("gateway key %s network error (%s); failing over",
+                            mask(key), type(exc).__name__)
+                if last_resp is not None:
+                    await last_resp.aclose()
+                    last_resp = None
+                continue
+            if resp.status_code == 200 or not KEY_POOL.should_failover(resp.status_code):
+                if resp.status_code == 200:
+                    KEY_POOL.report_success(key)
+                if last_resp is not None:
+                    await last_resp.aclose()
+                return resp, key
             KEY_POOL.report_failure(key)
-            log.warning("gateway key %s network error (%s); failing over",
-                        mask(key), type(exc).__name__)
-            # Close any previously held response before continuing so we
-            # don't leak a connection from a prior failed attempt.
+            log.warning("gateway key %s -> HTTP %d; failing over", mask(key), resp.status_code)
             if last_resp is not None:
                 await last_resp.aclose()
-                last_resp = None
-            continue
-        if resp.status_code == 200 or not KEY_POOL.should_failover(resp.status_code):
-            if resp.status_code == 200:
-                KEY_POOL.report_success(key)
-            # Close any prior failed response we were holding.
-            if last_resp is not None:
-                await last_resp.aclose()
-            return resp, key
-        KEY_POOL.report_failure(key)
-        log.warning("gateway key %s -> HTTP %d; failing over", mask(key), resp.status_code)
-        if last_resp is not None:
-            await last_resp.aclose()
-        last_resp, last_key = resp, key
+            last_resp, last_key = resp, key
     # All Vercel keys exhausted (or none configured). Try the fx.sh free
     # web-gateway fallback before giving up, so free-tier callers without a
     # gateway key still reach the model.

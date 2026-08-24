@@ -190,11 +190,11 @@ def _setup(calls: list[dict], *, fxweb_succeeds=True, pool_keys=None):
 
 class TestFxwebFallbackChat:
     def test_fallback_when_no_keys(self):
-        """With no Vercel keys, the fx.sh fallback serves the request.
+        """With no Vercel keys, the fx.sh fallback serves the request directly.
 
-        With no keys, _upstream_pooled makes one unauthenticated attempt to
-        the Vercel gateway (legacy behaviour), and when that fails the fx.sh
-        fallback takes over.
+        When no keys are configured and fx.sh is available, the proxy skips
+        the pointless unauthenticated Vercel attempt and goes straight to
+        fx.sh.
         """
         calls: list[dict] = []
         server.KEY_POOL = server.KeyPool([])
@@ -205,10 +205,10 @@ class TestFxwebFallbackChat:
         assert resp.status_code == 200
         body = resp.json()
         assert body["choices"][0]["message"]["content"] == "hello"
-        # One unauthenticated Vercel attempt, then fx.sh fallback.
+        # Goes straight to fx.sh — no Vercel attempt.
         paths = [c["path"] for c in calls]
-        assert "/v3/ai/language-model" in paths
         assert "/fx-wasm/gateway/v3/ai/language-model" in paths
+        assert "/v3/ai/language-model" not in paths
 
     def test_fallback_after_all_keys_fail(self):
         """When all Vercel keys fail, fx.sh fallback kicks in."""
